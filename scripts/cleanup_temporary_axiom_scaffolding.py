@@ -3,17 +3,20 @@ from __future__ import annotations
 
 import argparse
 import re
+import shutil
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 
 
-CI_BLOCK_START = "# temporary-theorem-audit:start"
-CI_BLOCK_END = "# temporary-theorem-audit:end"
-README_BLOCK_START = "<!-- temporary-theorem-docs:start -->"
-README_BLOCK_END = "<!-- temporary-theorem-docs:end -->"
+README_BLOCK_START = "<!-- temporary-axiom-docs:start -->"
+README_BLOCK_END = "<!-- temporary-axiom-docs:end -->"
 TEMP_ATTR_RE = re.compile(r"^\s*@\[[^\]]*\btemporary_axiom\b[^\]]*\]")
 THEOREM_NAME_RE = re.compile(r"\btheorem\s+([^\s:(]+)")
+WORKFLOW_BLOCK_MARKERS = (
+    ("# temporary-axiom-audit:start", "# temporary-axiom-audit:end"),
+    ("# approved-statement-registry-audit:start", "# approved-statement-registry-audit:end"),
+)
 
 
 @dataclass(frozen=True)
@@ -28,8 +31,13 @@ class CleanupConfig:
     project_root: Path
     utility_module: str
     utility_file: Path
+    registry_root_file: Path
+    registry_dir: Path
+    registry_db_dir: Path
     audit_file: Path
     audit_script: Path
+    registry_audit_script: Path
+    registry_tool_script: Path
     workflow_files: tuple[Path, ...]
     readme_file: Path
     docs_files: tuple[Path, ...]
@@ -43,7 +51,7 @@ def parse_args() -> CleanupConfig:
     parser = argparse.ArgumentParser(
         description=(
             "Locate remaining temporary_axiom declarations and, once none remain, "
-            "clean the temporary-theorem scaffolding from the project."
+            "clean the temporary-axiom scaffolding from the project."
         )
     )
     parser.add_argument(
@@ -53,17 +61,17 @@ def parse_args() -> CleanupConfig:
     )
     parser.add_argument(
         "--utility-module",
-        default="TestProject3.TemporaryTheorem",
-        help="Fully qualified module name for the temporary theorem utility.",
+        default="TestProject3.TemporaryAxiom",
+        help="Fully qualified module name for the temporary axiom utility.",
     )
     parser.add_argument(
         "--audit-file",
-        default="TemporaryTheoremAudit.lean",
+        default="TemporaryAxiomAudit.lean",
         help="Audit Lean file that runs #assert_no_temporary_axioms.",
     )
     parser.add_argument(
         "--audit-script",
-        default="scripts/run_temporary_theorem_audit.sh",
+        default="scripts/run_temporary_axiom_audit.sh",
         help="Shell script used by CI/CD to run the audit.",
     )
     parser.add_argument(
@@ -72,18 +80,18 @@ def parse_args() -> CleanupConfig:
         default=[".github/workflows/lean_action_ci.yml"],
         help=(
             "Workflow file containing removable CI audit blocks delimited by "
-            f"{CI_BLOCK_START!r} and {CI_BLOCK_END!r}. Can be repeated."
+            "the supported audit markers. Can be repeated."
         ),
     )
     parser.add_argument(
         "--readme-file",
         default="README.md",
-        help="README file containing the removable temporary-theorem docs block.",
+        help="README file containing the removable temporary-axiom docs block.",
     )
     parser.add_argument(
         "--keep-docs",
         action="store_true",
-        help="Keep the temporary-theorem documentation files instead of deleting them.",
+        help="Keep the temporary-axiom documentation files instead of deleting them.",
     )
     parser.add_argument(
         "--execute",
@@ -93,7 +101,7 @@ def parse_args() -> CleanupConfig:
     parser.add_argument(
         "--skip-audit",
         action="store_true",
-        help="Skip the pre-cleanup TemporaryTheoremAudit.lean check.",
+        help="Skip the pre-cleanup TemporaryAxiomAudit.lean check.",
     )
     parser.add_argument(
         "--skip-build",
@@ -109,13 +117,17 @@ def parse_args() -> CleanupConfig:
         project_root=project_root,
         utility_module=args.utility_module,
         utility_file=utility_file,
+        registry_root_file=project_root / "TestProject3/ApprovedStatementRegistry.lean",
+        registry_dir=project_root / "TestProject3/ApprovedStatementRegistry",
+        registry_db_dir=project_root / "approved_statement_registry_db",
         audit_file=project_root / args.audit_file,
         audit_script=project_root / args.audit_script,
+        registry_audit_script=project_root / "scripts/run_approved_statement_registry_audit.sh",
+        registry_tool_script=project_root / "scripts/manage_approved_statement_registry.py",
         workflow_files=tuple(project_root / path for path in args.workflow_file),
         readme_file=project_root / args.readme_file,
         docs_files=(
-            project_root / "docs/temporary_theorem_spec.md",
-            project_root / "docs/temporary_theorem_workflow.md",
+            project_root / "docs/temporary_axiom.md",
         ),
         execute=args.execute,
         keep_docs=args.keep_docs,
@@ -224,7 +236,11 @@ def cleanup_workflow_blocks(config: CleanupConfig) -> list[Path]:
         if not path.exists():
             continue
         old = path.read_text(encoding="utf-8")
-        new, removed = remove_delimited_blocks(old, CI_BLOCK_START, CI_BLOCK_END)
+        new = old
+        removed = 0
+        for start_marker, end_marker in WORKFLOW_BLOCK_MARKERS:
+            new, partial_removed = remove_delimited_blocks(new, start_marker, end_marker)
+            removed += partial_removed
         if removed > 0:
             if config.execute:
                 path.write_text(new, encoding="utf-8")
@@ -264,17 +280,27 @@ def remove_utility_imports(config: CleanupConfig) -> list[Path]:
 def delete_paths(config: CleanupConfig) -> list[Path]:
     delete_candidates = [
         config.utility_file,
+        config.registry_root_file,
         config.audit_file,
         config.audit_script,
+        config.registry_audit_script,
+        config.registry_tool_script,
     ]
     if not config.keep_docs:
         delete_candidates.extend(config.docs_files)
 
     existing = [path for path in delete_candidates if path.exists()]
+    dir_candidates = [
+        config.registry_dir,
+        config.registry_db_dir,
+    ]
+    existing_dirs = [path for path in dir_candidates if path.exists()]
     if config.execute:
         for path in existing:
             path.unlink()
-    return existing
+        for path in existing_dirs:
+            shutil.rmtree(path)
+    return existing + existing_dirs
 
 
 def verify_build(config: CleanupConfig) -> None:
@@ -291,13 +317,13 @@ def print_plan(
     deleted_paths: list[Path],
 ) -> None:
     mode = "Applying" if config.execute else "Planned"
-    print(f"{mode} temporary theorem scaffolding cleanup:")
+    print(f"{mode} temporary axiom scaffolding cleanup:")
     if import_updates:
-        print("  Lean files with TemporaryTheorem imports removed:")
+        print("  Lean files with TemporaryAxiom imports removed:")
         for path in import_updates:
             print(f"    - {path.relative_to(config.project_root)}")
     if workflow_updates:
-        print("  CI/CD workflow files with temporary-theorem audit blocks removed:")
+        print("  CI/CD workflow files with scaffolding audit blocks removed:")
         for path in workflow_updates:
             print(f"    - {path.relative_to(config.project_root)}")
     if readme_updates:
@@ -305,7 +331,7 @@ def print_plan(
         for path in readme_updates:
             print(f"    - {path.relative_to(config.project_root)}")
     if deleted_paths:
-        print("  Files deleted:")
+        print("  Paths deleted:")
         for path in deleted_paths:
             print(f"    - {path.relative_to(config.project_root)}")
     if not import_updates and not workflow_updates and not readme_updates and not deleted_paths:

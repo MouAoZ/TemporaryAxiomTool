@@ -1,0 +1,22 @@
+{
+  "schema_version": 1,
+  "shard_id": "chapter_00.section_02",
+  "chapter": 0,
+  "section": 2,
+  "entries": [
+    {
+      "decl_name": "TestProject3.SectionMainTheorem_2",
+      "module": "TestProject3.Section2",
+      "statement_pretty": "∀ {P Q R : Prop}, (P ∧ Q) ∧ R → R ∧ Q ∧ P",
+      "statement_hash": "3056373314800698359",
+      "needs_human_review": false,
+      "review_notes": [],
+      "review_status": "clear",
+      "approved_by": "ai-agent",
+      "approval_reason": "approved statement freeze",
+      "created_at": "2026-03-30T08:46:37Z",
+      "updated_at": "2026-03-30T08:46:37Z",
+      "approved_at": "2026-03-30T08:46:37Z"
+    }
+  ]
+}

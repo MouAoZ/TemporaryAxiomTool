@@ -1,4 +1,5 @@
 import TestProject3
+import TestProject3.TemporaryAxiom
 
 /-!
 Closure audit entrypoint.

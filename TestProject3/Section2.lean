@@ -1,5 +1,5 @@
 import TestProject3.Section1
-import TestProject3.TemporaryTheorem
+import TestProject3.TemporaryAxiom
 
 namespace TestProject3
 
