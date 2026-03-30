@@ -17,6 +17,7 @@
 
 - `current/`: 当前已批准陈述快照，按书籍的 chapter/section 分片
 - `history/`: 追加式历史事件日志，记录 `approve`、`commit`、`prune`、`rollback`
+- `archive/`: 由 `history --archive ...` 生成的归档包目录
 
 ## 分片命名规则
 
@@ -132,6 +133,40 @@
 ```
 
 这使得 `rollback` 可以在 entry 本体不保存 shard 信息的前提下，仍然可靠地做反向重放。
+
+## `archive/` 归档包格式
+
+`archive/` 中每个文件都是一次 history 归档操作生成的归档包。文件名格式通常为：
+
+- `history_archive.<ARCHIVE_ID>.json`
+
+其中 `<ARCHIVE_ID>` 形如：
+
+- `20260331T010203Z_history_archive_ab12cd34`
+
+归档包顶层字段如下：
+
+- `schema_version`: 数据格式版本号
+- `archive_id`: 归档包编号
+- `created_at`: 归档时间
+- `author`: 归档操作者
+- `reason`: 归档原因
+- `mode`: 归档模式，目前为 `decl_filter` 或 `all`
+- `decl_filter`: 仅在按定理过滤归档时出现，记录归档筛选条件
+- `source_event_count`: 被归档的 live 事件数量
+- `source_event_ids`: 被归档事件编号列表
+- `events`: 被归档的完整 history 事件列表
+
+归档包中的 `events` 仍使用与 `history/` 相同的事件结构，因此：
+
+- `history --include-archive` 可以直接读取这些归档事件
+- `rollback --event-id <EVENT_ID>` 可以直接从归档包中找到并回滚已归档事件
+
+注意：
+
+- 归档是“先打包，再从 live history 删除”，不是直接硬删除
+- `history --archive --archive-all --execute` 会清空当前 `history/`，但历史仍保留在 `archive/`
+- 按定理归档时，命中筛选条件的事件会整体进入归档包，以保持事件原子性
 
 ## 使用建议
 

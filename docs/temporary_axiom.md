@@ -268,6 +268,7 @@ python3 scripts/manage_approved_statement_registry.py commit \
 
 - 查看注册库历史事件
 - 可用于审计 agent 操作记录，也可配合 `rollback` 选择回退点
+- 支持把 live history 安全归档到 `approved_statement_registry_db/archive/`
 
 必填参数：
 
@@ -277,12 +278,20 @@ python3 scripts/manage_approved_statement_registry.py commit \
 
 - `--decl <DECL_NAME>`: 可重复；提供后只显示涉及这些定理的事件
 - `--limit <NUM>`: 最多输出多少条事件
+- `--include-archive`: 打印时一并包含归档事件
+- `--archive-only`: 打印时只显示归档事件
+- `--archive`: 切换到归档模式，把匹配的 live history 打包到 `archive/`
+- `--archive-all`: 与 `--archive` 配合使用，归档当前全部 live history
+- `--reason <TEXT>`: 归档模式下写入归档包元数据
+- `--author <TEXT>`: 归档模式下写入归档包元数据，默认值为 `ai-agent`
+- `--execute`: 归档模式下真正执行；不带该参数时只做 dry-run
 
 输出内容：
 
 - 事件编号、动作类型、作者、时间、原因
 - 每条变更涉及的定理名和变更类型
 - 若该事件新增了 review note，则额外打印该 note
+- 若事件来自归档包，会额外标出 `source=archive:<ARCHIVE_ID>`
 
 查看历史：
 
@@ -290,6 +299,40 @@ python3 scripts/manage_approved_statement_registry.py commit \
 python3 scripts/manage_approved_statement_registry.py history \
   --decl TestProject3.SectionMainTheorem_2
 ```
+
+查看包含归档的历史：
+
+```bash
+python3 scripts/manage_approved_statement_registry.py history \
+  --decl TestProject3.SectionMainTheorem_2 \
+  --include-archive
+```
+
+按定理归档 history：
+
+```bash
+python3 scripts/manage_approved_statement_registry.py history \
+  --archive \
+  --decl TestProject3.SectionMainTheorem_2 \
+  --reason "archive reviewed theorem history" \
+  --execute
+```
+
+归档全部 live history：
+
+```bash
+python3 scripts/manage_approved_statement_registry.py history \
+  --archive \
+  --archive-all \
+  --reason "archive all live history" \
+  --execute
+```
+
+注意：
+
+- 归档时会把匹配事件整体打包后从 `history/` 删除，但不会丢失到数据库外
+- `rollback` 会同时搜索 `history/` 与 `archive/`
+- 按 `--decl` 归档时，凡是命中过滤条件的事件都会整体移动到归档包，即使该事件还涉及其他定理
 
 ##### `rollback`
 
