@@ -1,13 +1,9 @@
-name = "test_project3"
+name = "temporary_axiom_tool"
 version = "0.1.0"
-defaultTargets = ["test_project3"]
+defaultTargets = ["TemporaryAxiomTool"]
 
 [[lean_lib]]
-name = "TestProject3"
-
-[[lean_exe]]
-name = "test_project3"
-root = "Main"
+name = "TemporaryAxiomTool"
 
 [[require]]
 name = "checkdecls"

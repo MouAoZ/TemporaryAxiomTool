@@ -6,11 +6,11 @@ from __future__ import annotations
 The registry is maintained in two layers:
 
 1. JSON data under `approved_statement_registry_db/`
-2. generated Lean files under `TestProject3/ApprovedStatementRegistry/`
+2. generated Lean files under `TemporaryAxiomTool/ApprovedStatementRegistry/`
 
 Lean only reads the generated modules during compilation. This script is the
 offline bridge that probes declarations through the root
-`TestProject3.ApprovedStatementRegistry` module, updates JSON history, and
+`TemporaryAxiomTool.ApprovedStatementRegistry` module, updates JSON history, and
 regenerates the Lean registry.
 """
 
@@ -31,6 +31,10 @@ from typing import Any, NoReturn
 
 SCHEMA_VERSION = 1
 DEFAULT_AUTHOR = "ai-agent"
+TOOL_NAMESPACE = "TemporaryAxiomTool"
+TOOL_REGISTRY_MODULE = f"{TOOL_NAMESPACE}.ApprovedStatementRegistry"
+TOOL_REGISTRY_TYPES_MODULE = f"{TOOL_REGISTRY_MODULE}.Types"
+TOOL_SHARDS_MODULE = f"{TOOL_REGISTRY_MODULE}.Shards"
 SEVERITY_ORDER = {
     "clear": -1,
     "comment": 0,
@@ -83,12 +87,12 @@ def lean_shard_const(chapter: int, section: int) -> str:
 
 
 def lean_shard_module(chapter: int, section: int) -> str:
-    return f"TestProject3.ApprovedStatementRegistry.Shards.{lean_shard_stem(chapter, section)}"
+    return f"{TOOL_SHARDS_MODULE}.{lean_shard_stem(chapter, section)}"
 
 
 def make_paths(project_root: Path) -> RegistryPaths:
     data_root = project_root / "approved_statement_registry_db"
-    lean_root = project_root / "TestProject3" / "ApprovedStatementRegistry"
+    lean_root = project_root / TOOL_NAMESPACE / "ApprovedStatementRegistry"
     return RegistryPaths(
         project_root=project_root,
         data_root=data_root,
@@ -98,7 +102,7 @@ def make_paths(project_root: Path) -> RegistryPaths:
         lean_root=lean_root,
         generated_file=lean_root / "Generated.lean",
         shards_dir=lean_root / "Shards",
-        build_target="TestProject3.ApprovedStatementRegistry",
+        build_target=TOOL_REGISTRY_MODULE,
     )
 
 
@@ -316,7 +320,7 @@ def explain_command_failure(
                 "确认 import 路径没有拼写错误",
             ],
             "suggestions": [
-                "先运行 `lake build` 或 `lake build TestProject3.ApprovedStatementRegistry`",
+                f"先运行 `lake build` 或 `lake build {TOOL_REGISTRY_MODULE}`",
                 "如果刚改过生成文件，先执行 `generate` 或重新运行触发生成的命令",
             ],
             "raw_output": output,
@@ -884,12 +888,12 @@ def generate_lean_registry(paths: RegistryPaths) -> None:
         entries_block = ",\n".join(entry_lines)
         shard_source = (
             "/- Auto-generated approved-statement shard. Do not edit by hand. -/\n"
-            "import TestProject3.ApprovedStatementRegistry.Types\n\n"
-            "namespace TestProject3.ApprovedStatementRegistry\n\n"
+            f"import {TOOL_REGISTRY_TYPES_MODULE}\n\n"
+            f"namespace {TOOL_REGISTRY_MODULE}\n\n"
             f"def {const_name} : Array ApprovedStatement := #[\n"
             f"{entries_block}\n"
             "]\n\n"
-            "end TestProject3.ApprovedStatementRegistry\n"
+            f"end {TOOL_REGISTRY_MODULE}\n"
         )
         shard_path.write_text(shard_source, encoding="utf-8")
 
@@ -897,24 +901,24 @@ def generate_lean_registry(paths: RegistryPaths) -> None:
         if path not in wanted_files:
             path.unlink()
 
-    import_block = "\n".join(["import TestProject3.ApprovedStatementRegistry.Types", *imports])
+    import_block = "\n".join([f"import {TOOL_REGISTRY_TYPES_MODULE}", *imports])
     if consts:
         body = " ++\n  ".join(consts)
         generated_source = (
             "/- Auto-generated registry aggregate. Do not edit by hand. -/\n"
             f"{import_block}\n\n"
-            "namespace TestProject3.ApprovedStatementRegistry\n\n"
+            f"namespace {TOOL_REGISTRY_MODULE}\n\n"
             "def generatedApprovedStatements : Array ApprovedStatement :=\n"
             f"  {body}\n\n"
-            "end TestProject3.ApprovedStatementRegistry\n"
+            f"end {TOOL_REGISTRY_MODULE}\n"
         )
     else:
         generated_source = (
             "/- Auto-generated registry aggregate. Do not edit by hand. -/\n"
-            "import TestProject3.ApprovedStatementRegistry.Types\n\n"
-            "namespace TestProject3.ApprovedStatementRegistry\n\n"
+            f"import {TOOL_REGISTRY_TYPES_MODULE}\n\n"
+            f"namespace {TOOL_REGISTRY_MODULE}\n\n"
             "def generatedApprovedStatements : Array ApprovedStatement := #[]\n\n"
-            "end TestProject3.ApprovedStatementRegistry\n"
+            f"end {TOOL_REGISTRY_MODULE}\n"
         )
     paths.generated_file.write_text(generated_source, encoding="utf-8")
 

@@ -30,6 +30,7 @@ class MarkerHit:
 class CleanupConfig:
     project_root: Path
     utility_module: str
+    utility_root_file: Path
     utility_file: Path
     registry_root_file: Path
     registry_dir: Path
@@ -61,7 +62,7 @@ def parse_args() -> CleanupConfig:
     )
     parser.add_argument(
         "--utility-module",
-        default="TestProject3.TemporaryAxiom",
+        default="TemporaryAxiomTool.TemporaryAxiom",
         help="Fully qualified module name for the temporary axiom utility.",
     )
     parser.add_argument(
@@ -111,14 +112,17 @@ def parse_args() -> CleanupConfig:
     args = parser.parse_args()
 
     project_root = Path(args.project_root).resolve()
+    utility_root_name = args.utility_module.split(".")[0]
     utility_file = project_root / (args.utility_module.replace(".", "/") + ".lean")
+    utility_root_file = project_root / f"{utility_root_name}.lean"
 
     return CleanupConfig(
         project_root=project_root,
         utility_module=args.utility_module,
+        utility_root_file=utility_root_file,
         utility_file=utility_file,
-        registry_root_file=project_root / "TestProject3/ApprovedStatementRegistry.lean",
-        registry_dir=project_root / "TestProject3/ApprovedStatementRegistry",
+        registry_root_file=project_root / f"{utility_root_name}/ApprovedStatementRegistry.lean",
+        registry_dir=project_root / f"{utility_root_name}/ApprovedStatementRegistry",
         registry_db_dir=project_root / "approved_statement_registry_db",
         audit_file=project_root / args.audit_file,
         audit_script=project_root / args.audit_script,
@@ -279,6 +283,7 @@ def remove_utility_imports(config: CleanupConfig) -> list[Path]:
 
 def delete_paths(config: CleanupConfig) -> list[Path]:
     delete_candidates = [
+        config.utility_root_file,
         config.utility_file,
         config.registry_root_file,
         config.audit_file,

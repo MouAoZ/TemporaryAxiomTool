@@ -1,20 +1,19 @@
-/-
-Approved statement registry root module.
+/- 
+已批准陈述注册库的 Lean 侧根模块。
 
-This is the only manually maintained registry entrypoint imported by
-`TemporaryAxiom`. It contains:
+这是由 `TemporaryAxiom` 直接依赖的唯一手写入口，负责：
 
-- the statement-hash implementation used for declaration validation
-- the offline `#print_approved_statement_probe` command used by the Python tool
-- the assembly step that turns generated shard data into a lookup map
+- 定义 statement hash 算法
+- 提供离线探测命令 `#print_approved_statement_probe`
+- 把自动生成的 shard 数据装配成查找表
 -/
 import Lean
-import TestProject3.ApprovedStatementRegistry.Types
-import TestProject3.ApprovedStatementRegistry.Generated
+import TemporaryAxiomTool.ApprovedStatementRegistry.Types
+import TemporaryAxiomTool.ApprovedStatementRegistry.Generated
 
 open Lean Elab Command Meta
 
-namespace TestProject3.ApprovedStatementRegistry
+namespace TemporaryAxiomTool.ApprovedStatementRegistry
 
 private def binderInfoHash : BinderInfo → UInt64
   | .default => hash 0
@@ -74,8 +73,9 @@ private partial def hashExprCore (levelParamIndex : NameMap Nat) : Expr → UInt
       mixHash (hash 20) <| mixHash (hash structName) <| mixHash (hash idx) (hashExprCore levelParamIndex body)
 
 /--
-Hash the elaborated type of a declaration. This is the canonical statement hash
-used by both the generated registry and the `@[temporary_axiom]` validator.
+对声明的 elaborated type 做稳定哈希。
+
+这份 hash 是批准注册库与 `@[temporary_axiom]` 校验共同使用的唯一标准。
 -/
 def statementHash (levelParams : List Name) (type : Expr) : UInt64 :=
   hashExprCore (mkLevelParamIndex levelParams) type
@@ -91,8 +91,9 @@ private def probeJson (declName : Name) (statementHash : UInt64) (statementPrett
   ]
 
 /--
-Offline probe command used by the Python registry manager. It elaborates the
-target declaration and prints one JSON line describing the frozen statement.
+提供给 Python 管理脚本的离线探测命令。
+
+它会读取目标声明的最终类型，并输出一行 JSON，供外部注册库冻结该陈述。
 -/
 elab "#print_approved_statement_probe " id:ident : command => do
   let declName ← liftCoreM <| Elab.realizeGlobalConstNoOverloadWithInfo id
@@ -108,4 +109,4 @@ def approvedStatements : Array ApprovedStatement :=
 def approvedStatementMap : ApprovedStatementMap :=
   insertApprovedStatements {} approvedStatements
 
-end TestProject3.ApprovedStatementRegistry
+end TemporaryAxiomTool.ApprovedStatementRegistry

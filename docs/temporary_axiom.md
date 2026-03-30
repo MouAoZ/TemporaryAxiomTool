@@ -1,693 +1,193 @@
-# Temporary Axiom 说明文档
+# TemporaryAxiomTool 工作流说明
 
 ## 目标
 
-`TemporaryAxiom` 用于并行形式化时的“定理到临时公理”转换，但转换必须满足两个前提：
+`TemporaryAxiomTool` 用于并行形式化中的“定理陈述先批准，证明后补齐”工作流。
 
-1. 被跳过的定理陈述已经先行形式化，并进入已批准陈述表
-2. 工作组只在确有并行依赖需要时，才显式添加 `@[temporary_axiom]`
+核心原则：
 
-因此，`@[temporary_axiom]` 仅用于在跳过非工作区已批准定理或跳过过于困难的已批准定理.
+1. 先把可能被下游依赖的 theorem statement 形式化并批准入库
+2. 只有确实需要并行跳过时，才为该 theorem 添加 `@[temporary_axiom]`
+3. `@[temporary_axiom]` 只允许用于已批准陈述
+
+因此，这个工具解决的是“证明暂时缺失，但陈述已经可信”的场景，而不是让任意 theorem 都能被静默跳过。
 
 ## 总体架构
 
-方案由三层组成：
+工具由三层组成：
 
-1. 外部注册库数据库：
+1. Lean 侧临时公理工具：
+   [TemporaryAxiomTool/TemporaryAxiom.lean](../TemporaryAxiomTool/TemporaryAxiom.lean)
+2. Lean 侧批准注册表：
+   [TemporaryAxiomTool/ApprovedStatementRegistry.lean](../TemporaryAxiomTool/ApprovedStatementRegistry.lean)
+3. 外部注册库数据库：
    [approved_statement_registry_db/README.md](../approved_statement_registry_db/README.md)
-2. 由 Python 工具生成的 Lean 注册表模块：
-   [TestProject3/ApprovedStatementRegistry.lean](../TestProject3/ApprovedStatementRegistry.lean)
-3. 临时公理转换与即时校验模块：
-   [TestProject3/TemporaryAxiom.lean](../TestProject3/TemporaryAxiom.lean)
 
-职责划分如下：
+职责划分：
 
-- 外部数据库负责版本管理、历史事件、评论、警报和回滚
-- 生成的 Lean 注册表负责在编译期提供只读校验数据
-- `TemporaryAxiom` 负责语法改写、`@[temporary_axiom]` 标签注册和即时合法性检查
+- `TemporaryAxiom` 负责 theorem -> axiom 改写与即时合法性检查
+- `ApprovedStatementRegistry` 负责 statement hash、probe 命令和查找表装配
+- 外部数据库负责批准记录、历史事件、review note 与归档
 
-## Lean 侧文件
+## Lean 侧工作流
 
-[TestProject3/TemporaryAxiom.lean](../TestProject3/TemporaryAxiom.lean)：
-
-- 定义 `@[temporary_axiom]`
-- 将带标签的 theorem 改写为 axiom
-- 在声明处立即校验是否存在批准记录以及 statement hash 是否匹配
-- 提供 `#print_temporary_axioms` 与 `#assert_no_temporary_axioms` 作为审计
-
-[TestProject3/ApprovedStatementRegistry.lean](../TestProject3/ApprovedStatementRegistry.lean)：
-
-- 手写的注册库根模块
-- 提供 statement hash 算法
-- 提供给 Python 工具调用的 `#print_approved_statement_probe`
-- 把生成的批准记录装配成 `approvedStatementMap`
-
-[TestProject3/ApprovedStatementRegistry/Types.lean](../TestProject3/ApprovedStatementRegistry/Types.lean)：
-
-- 定义结构体 `ApprovedStatement`
-- `ApprovedStatementMap`
-- 供自动生成分片复用的稳定类型接口
-
-[TestProject3/ApprovedStatementRegistry/Generated.lean](../TestProject3/ApprovedStatementRegistry/Generated.lean)：
-
-- 自动生成的汇总文件, 只负责把 `Shards/` 里的各分片的数组拼接成 `generatedApprovedStatements`
-- import 所有 chapter/section 分片
-
-[TestProject3/ApprovedStatementRegistry/Shards/](../TestProject3/ApprovedStatementRegistry/Shards/)：
-
-- 自动生成的 chapter/section Lean 分片目录, `Shards/` 里每个文件保存一个 chapter/section 的实际条目
-- 承载提供给 Lean 注册的批准记录数据
-
-#### 编译行为与报错时机
-
-对如下跳过定理的声明：
+当 Lean 读到：
 
 ```lean
 @[temporary_axiom]
-theorem SectionMainTheorem_2 (h : (P ∧ Q) ∧ R) : R ∧ (Q ∧ P) := by
-  {}
+theorem YourProject.someTheorem (h : P ∧ Q) : Q ∧ P := by
+  sorry
 ```
 
-Lean 侧顺序如下：
+处理顺序如下：
 
-1. 解析器读取完整 `declaration`
+1. parser 读入完整 `declaration`
 2. command macro 发现该 theorem 带有 `@[temporary_axiom]`
-3. macro 丢弃 `:= by ...`，仅保留声明头，将其改写为 `axiom`
-4. Lean 对改写后的声明进行正常 elaboration
-5. `@[temporary_axiom]` 属性在 `afterTypeChecking` 阶段运行
-6. 属性处理器读取已经导入环境的已批准陈述表，校验：
-   - 定理名是否已批准
+3. macro 丢弃证明体，仅保留声明头，并将 `theorem` 改写为 `axiom`
+4. Lean 对改写后的声明正常 elaboration
+5. attribute 在 `afterTypeChecking` 阶段运行
+6. 工具读取环境中已生成的批准注册表，检查：
+   - 声明名是否已批准
    - 当前 elaborated statement hash 是否与批准记录一致
 
-注意:
-- Lean 不会在 macro 节点直接查询外部 JSON 数据库
-- 外部数据库交互发生在编译之前，由 Python 工具离线完成
-- 非法 `@[temporary_axiom]` 会在该声明自身处立刻报错，不会等到后续引用时才失败
+若不满足条件，报错会在该声明处立刻跳出。
 
-#### 转换不变量
+## import 规则
 
-macro 只做一件事：把 `theorem` 头改成 `axiom` 头。
+宿主项目普通文件不需要额外 import。
 
-它保留原始声明中的：
+只有需要使用 `@[temporary_axiom]` 的文件需要：
 
-- 命名空间
-- 声明名
-- universe 参数
-- binder 列表
-- 返回类型
-- `private`、`protected`、doc comment、其他属性
+```lean
+import TemporaryAxiomTool.TemporaryAxiom
+```
 
-因此参数绑定、命名空间解析和 Lean 原生声明行为保持一致，避免转换造成参数或命名空间不一致。
+这样可以把工具依赖限制在真正需要跳过证明的模块里。
 
-#### import 边界
-
-1. 普通工程文件：
-
-- 不需要任何额外 import
-
-2. 含有 `@[temporary_axiom]` 的工程文件：
-
-- 只需要 `import TestProject3.TemporaryAxiom`
-
-3. 工具文件:
-
-[TestProject3/TemporaryAxiom.lean](../TestProject3/TemporaryAxiom.lean) 本身只依赖：
-- `Lean`
-- `TestProject3.ApprovedStatementRegistry`
-
-[TestProject3/ApprovedStatementRegistry.lean](../TestProject3/ApprovedStatementRegistry.lean) 本身只依赖：
-- `Lean`
-- `TestProject3.ApprovedStatementRegistry.Types`
-- `TestProject3.ApprovedStatementRegistry.Generated`
-
-[TestProject3/ApprovedStatementRegistry/Generated.lean](../TestProject3/ApprovedStatementRegistry/Generated.lean) 只依赖：
-- `TestProject3.ApprovedStatementRegistry.Types`
-- `TestProject3.ApprovedStatementRegistry.Shards.*`
-
-因此更新已批准陈述表时，只会改动方案内部控制的 Lean 文件与外部数据库文件，不会把 import 变化扩散到其他业务证明文件。
-
-## 外部数据库
+## 已批准陈述注册库
 
 外部数据库位于：
-- 当前状态：`approved_statement_registry_db/current/`
-- 历史事件：`approved_statement_registry_db/history/`
 
-当前实现中：
+- `approved_statement_registry_db/current/`
+- `approved_statement_registry_db/history/`
+- `approved_statement_registry_db/archive/`
 
-- `current/` 的 entry 不再重复保存 `chapter`、`section`、`shard_id`
-- `statement_pretty` 以 UTF-8 可读字符直接保存，便于人工审阅
-- `history/` 通过 `before_shard` / `after_shard` 保留回滚所需的定位信息
+Lean 侧自动生成文件位于：
 
-格式详见[外部数据库文档](../approved_statement_registry_db/README.md)
+- `TemporaryAxiomTool/ApprovedStatementRegistry/Generated.lean`
+- `TemporaryAxiomTool/ApprovedStatementRegistry/Shards/`
 
+数据库格式详见：
 
-#### 管理工具
+- [approved_statement_registry_db/README.md](../approved_statement_registry_db/README.md)
+
+## 管理脚本
 
 统一入口：
 
 - [scripts/manage_approved_statement_registry.py](../scripts/manage_approved_statement_registry.py)
 
-全局参数：
+核心命令：
 
-- `--project-root <PATH>`
-- 可选参数
-- 默认值为 `.`，表示 Lean 项目根目录
-- 所有子命令都支持这个参数
+- `approve`: 冻结一个或多个 theorem 的当前陈述
+- `commit`: 给已批准定理追加 review note
+- `prune`: 从注册库移除定理
+- `rollback`: 回滚某个历史事件
+- `history`: 查看或归档历史
+- `audit`: 对照当前 Lean 环境做 hash 审计
+- `generate`: 仅根据 current 快照重建 Lean 侧文件
 
-参数格式约定：
+查看完整参数：
 
-- `<PATH>`
-- 文件系统路径，例如 `.`、`/home/mouao/lean_projects/test_project3`
-- `<MODULE_NAME>`
-- Lean 模块名，例如 `TestProject3.Section2`
-- `<DECL_NAME>`
-- Lean 全限定声明名，例如 `TestProject3.SectionMainTheorem_2`
-- `<NUM>`
-- 十进制整数，例如 `0`、`2`
-- `<EVENT_ID>`
-- 历史事件编号，例如 `20260330T084637Z_approve_bbee340b`
-- `--decl`
-- 可重复参数；同一命令中写多次表示一次处理多个定理
+```bash
+python3 scripts/manage_approved_statement_registry.py --help
+python3 scripts/manage_approved_statement_registry.py approve --help
+```
 
-支持的核心命令：
-
-- `approve`
-- `commit`
-- `history`
-- `rollback`
-- `prune`
-- `audit`
-- `generate`
-
-##### `approve`
-
-用途：
-
-- 将一个或多个已形式化且陈述可信的定理写入已批准陈述库
-- 若该定理已经存在，则更新其记录
-- 若其原先位于别的 chapter/section 分片，工具会自动迁移到新分片
-
-必填参数：
-
-- `--module <MODULE_NAME>`
-- `--chapter <NUM>`
-- `--section <NUM>`
-- 至少一个 `--decl <DECL_NAME>`
-
-可选参数：
-
-- `--reason <TEXT>`: 默认值为 `approved statement freeze`
-- `--author <TEXT>`: 默认值为 `ai-agent`
-- `--skip-build`: 开关参数；提供后跳过 `lake build`
-
-副作用：
-
-- 调用 Lean probe 读取当前声明的 elaborated statement
-- 更新 `approved_statement_registry_db/current/`
-- 追加一条 `approve` 历史事件到 `approved_statement_registry_db/history/`
-- 重建 Lean 侧 `Generated.lean` 与 `Shards/`
-- 默认重新 build `TestProject3.ApprovedStatementRegistry`
-
-典型 `approve` 示例：
+### 典型 `approve`
 
 ```bash
 python3 scripts/manage_approved_statement_registry.py approve \
-  --module TestProject3.Section2 \
-  --chapter 0 \
+  --module YourProject.Section2 \
+  --chapter 3 \
   --section 2 \
-  --decl TestProject3.SectionMainTheorem_2
+  --decl YourProject.someTheorem
 ```
 
-同一模块、同一小节下一次导入多个定理：
-
-```bash
-python3 scripts/manage_approved_statement_registry.py approve \
-  --module TestProject3.Section2 \
-  --chapter 0 \
-  --section 2 \
-  --decl TestProject3.lemma_2_1 \
-  --decl TestProject3.lemma_2_2 \
-  --decl TestProject3.SectionMainTheorem_2
-```
-
-##### `commit`
-
-用途：
-
-- 为已批准定理追加审核备注、风险提示或人工复核提醒
-
-必填参数：
-
-- 至少一个 `--decl <DECL_NAME>`
-- `--message <TEXT>`
-
-可选参数：
-
-- `--severity <LEVEL>`: 可选值为 `comment`、`warning`、`alert`, 默认值为 `warning`
-- `--reason <TEXT>`: 默认情况下写入 `--message` 的内容
-- `--author <TEXT>`: 默认值为 `ai-agent`
-
-副作用：
-
-- 不改动 statement hash
-- 更新对应条目的 `review_notes`、`review_status`、`needs_human_review`
-- 追加一条 `commit` 历史事件
-
-追加审核备注：
+### 典型 `commit`
 
 ```bash
 python3 scripts/manage_approved_statement_registry.py commit \
-  --decl TestProject3.SectionMainTheorem_2 \
+  --decl YourProject.someTheorem \
   --severity warning \
-  --message "Check whether implicit arguments were inferred as intended."
+  --message "binder names changed recently; manual review recommended"
 ```
 
-##### `history`
-
-用途：
-
-- 查看注册库历史事件
-- 可用于审计 agent 操作记录，也可配合 `rollback` 选择回退点
-- 支持把 live history 安全归档到 `approved_statement_registry_db/archive/`
-
-必填参数：
-
-- 无
-
-可选参数：
-
-- `--decl <DECL_NAME>`: 可重复；提供后只显示涉及这些定理的事件
-- `--limit <NUM>`: 最多输出多少条事件
-- `--include-archive`: 打印时一并包含归档事件
-- `--archive-only`: 打印时只显示归档事件
-- `--archive`: 切换到归档模式，把匹配的 live history 打包到 `archive/`
-- `--archive-all`: 与 `--archive` 配合使用，归档当前全部 live history
-- `--reason <TEXT>`: 归档模式下写入归档包元数据
-- `--author <TEXT>`: 归档模式下写入归档包元数据，默认值为 `ai-agent`
-- `--execute`: 归档模式下真正执行；不带该参数时只做 dry-run
-
-输出内容：
-
-- 事件编号、动作类型、作者、时间、原因
-- 每条变更涉及的定理名和变更类型
-- 若该事件新增了 review note，则额外打印该 note
-- 若事件来自归档包，会额外标出 `source=archive:<ARCHIVE_ID>`
-
-查看历史：
-
-```bash
-python3 scripts/manage_approved_statement_registry.py history \
-  --decl TestProject3.SectionMainTheorem_2
-```
-
-查看包含归档的历史：
-
-```bash
-python3 scripts/manage_approved_statement_registry.py history \
-  --decl TestProject3.SectionMainTheorem_2 \
-  --include-archive
-```
-
-按定理归档 history：
-
-```bash
-python3 scripts/manage_approved_statement_registry.py history \
-  --archive \
-  --decl TestProject3.SectionMainTheorem_2 \
-  --reason "archive reviewed theorem history" \
-  --execute
-```
-
-归档全部 live history：
-
-```bash
-python3 scripts/manage_approved_statement_registry.py history \
-  --archive \
-  --archive-all \
-  --reason "archive all live history" \
-  --execute
-```
-
-注意：
-
-- 归档时会把匹配事件整体打包后从 `history/` 删除，但不会丢失到数据库外
-- `rollback` 会同时搜索 `history/` 与 `archive/`
-- 按 `--decl` 归档时，凡是命中过滤条件的事件都会整体移动到归档包，即使该事件还涉及其他定理
-
-##### `rollback`
-
-用途：
-
-- 按历史事件编号回滚一次 `approve`、`commit`、`prune` 或更早的 `rollback`
-
-必填参数：
-
-- `--event-id <EVENT_ID>`
-
-可选参数：
-
-- `--reason <TEXT>`: 默认值为 `rollback of <EVENT_ID>`
-- `--author <TEXT>`: 默认值为 `ai-agent`
-- `--skip-build`: 开关参数；提供后跳过 `lake build`
-
-副作用：
-
-- 根据目标事件中的 `before/after` 记录反向重放修改
-- 追加一条新的 `rollback` 历史事件
-- 重建 Lean 侧注册表
-- 默认重新 build
-
-回滚事件：
-
-```bash
-python3 scripts/manage_approved_statement_registry.py rollback \
-  --event-id <history-event-id>
-```
-
-##### `prune`
-
-用途：
-
-- 从已批准陈述库中删除一个或多个定理
-
-必填参数：
-
-- 至少一个 `--decl <DECL_NAME>`
-
-可选参数：
-
-- `--reason <TEXT>`: 默认值为 `removed from approved statement registry`
-- `--author <TEXT>`: 默认值为 `ai-agent`
-- `--skip-build`: 开关参数；提供后跳过 `lake build`
-
-副作用：
-
-- 从 `current/` 中删除对应条目
-- 追加一条 `prune` 历史事件
-- 重建 Lean 侧注册表
-- 默认重新 build
-
-注意：
-
-- 若源码中某个 theorem 仍带有 `@[temporary_axiom]`，而它对应的批准记录被 `prune` 删除，则 Lean 会在该声明处立刻报错
-
-示例：
-
-```bash
-python3 scripts/manage_approved_statement_registry.py prune \
-  --decl TestProject3.SectionMainTheorem_2 \
-  --reason "remove from approved registry"
-```
-
-##### `audit`
-
-用途：
-
-- 将当前 Lean 环境中的声明重新 probe，并与注册库中的 `statement_hash` 做比对
-- 可选地把 review note 的严重级别提升为 CI 失败条件
-
-必填参数：
-
-- 无
-
-可选参数：
-
-- `--decl <DECL_NAME>`: 可重复；提供后只审计这些定理
-- `--fail-on-review-status <LEVEL>`: 可选值为 `comment`、`warning`、`alert`
-- 若选中条目的 `review_status` 达到或超过该级别，则命令失败
-
-输出内容：
-
-- hash 不一致时直接失败
-- review note 存在时打印最近一条提示
-- 无问题时打印通过统计
-
-审计：
+### 典型 `audit`
 
 ```bash
 python3 scripts/manage_approved_statement_registry.py audit
 ```
 
-按 review status 阈值触发失败：
+### 典型 `history`
 
 ```bash
-python3 scripts/manage_approved_statement_registry.py audit \
-  --fail-on-review-status warning
+python3 scripts/manage_approved_statement_registry.py history --include-archive
 ```
 
-##### `generate`
-
-用途：
-
-- 根据 `approved_statement_registry_db/current/` 的当前快照重新生成 Lean 侧注册表文件
-- 适合处理合并冲突后的重建，或只想刷新生成文件时使用
-
-必填参数：
-
-- 无
-
-可选参数：
-
-- `--skip-build`: 开关参数；提供后跳过 `lake build`
-
-副作用：
-
-- 重写 `TestProject3/ApprovedStatementRegistry/Generated.lean`
-- 重写 `TestProject3/ApprovedStatementRegistry/Shards/`
-- 默认重新 build
-
-示例：
+### 典型 `rollback`
 
 ```bash
-python3 scripts/manage_approved_statement_registry.py generate
+python3 scripts/manage_approved_statement_registry.py rollback \
+  --event-id 20260331T010203Z_approve_ab12cd34
 ```
-
-## 并行工作流
-
-推荐把整个流程分成四个阶段：
-
-1. 上游先形式化并冻结可能需要依赖的定理陈述
-2. 通过已批准陈述表登记这些可被跳过的陈述
-3. 各 section 小组并行形式化，必要时才添加 `@[temporary_axiom]`
-4. 证明补齐后移除标签，最终审计并清理脚手架
-
-#### 预批准陈述
-
-上游工作组先把可能成为依赖接口的定理陈述写对，再运行 `approve`。工具会：
-
-1. 调用 Lean probe 读取当前声明
-2. 自动生成 `decl_name`、`statement_hash`、`statement_pretty`
-3. 写入外部数据库
-4. 重建 Lean 侧已批准陈述表分片
-
-如果某个陈述虽然先登记了，但仍希望人工重点审核，可追加 `commit` 备注。支持的备注级别：
-
-- `comment`
-- `warning`
-- `alert`
-
-#### 并行形式化
-
-只有在确实需要跳过某个已批准定理时，才在对应 theorem 上加入：
-
-```lean
-@[temporary_axiom]
-theorem SectionMainTheorem_2 (h : (P ∧ Q) ∧ R) : R ∧ (Q ∧ P) := by
-  {}
-```
-
-如果该定理未被批准，或当前 theorem header 与批准陈述不一致，Lean 会在这一行声明处立即报错。
-
-#### 合并与恢复
-
-并行开始前：
-
-1. 上游分支先合并“陈述冻结 + 已批准陈述表更新”
-2. 主集成分支开启已批准陈述表审计
-3. 各 section 分支再按需添加 `@[temporary_axiom]`
-
-并行进行中：
-
-- 小组只改自己 section 的证明文件
-- 若新增可跳过接口，先更新已批准陈述表，再提交标签变更
-- `approved_statement_registry_db/history/` 持续记录 approve、commit、prune、rollback 事件
-
-恢复真实证明时：
-
-1. theorem owner 补全证明
-2. 删除 `@[temporary_axiom]`
-3. 合并恢复提交
-4. 如某条批准记录已无必要，可后续再 `prune`
-
-冲突处理建议：
-
-- `approved_statement_registry_db/current/` 与 `history/` 冲突时，不手工拼接 JSON
-- 先保留双方事件文件
-- 再运行 `python3 scripts/manage_approved_statement_registry.py generate`
-- 必要时重新执行 `audit`
 
 ## 审计与 CI/CD
 
-推荐把审计分成两类。
-
-常开审计：
-
-- 已批准陈述表一致性审计
-
-闭环审计：
-
-- 临时公理清零审计
-
-#### 已批准陈述表审计
-
-统一入口：
-
-- [scripts/run_approved_statement_registry_audit.sh](../scripts/run_approved_statement_registry_audit.sh)
-
-GitHub Actions 片段：
-
-```yaml
-      # approved-statement-registry-audit:start
-      - name: Approved statement registry audit
-        run: ./scripts/run_approved_statement_registry_audit.sh
-      # approved-statement-registry-audit:end
-```
-
-这一步适合长期启用，因为它只检查：
-
-- 当前 Lean 声明是否仍与批准记录一致
-- 当前日志中是否存在 review note
-- 如果使用 `--fail-on-review-status`，还能把高风险陈述升级为 CI 失败
-
-#### 临时公理清零审计
-
-当某一集成分支声明“已经没有任何 `@[temporary_axiom]`”时，再启用：
-
-```yaml
-      # temporary-axiom-audit:start
-      - name: Temporary axiom closure audit
-        run: ./scripts/run_temporary_axiom_audit.sh
-      # temporary-axiom-audit:end
-```
-
-入口文件：
-
-- [TemporaryAxiomAudit.lean](../TemporaryAxiomAudit.lean)
-
-只要环境里还存在任何临时公理，这个审计就会失败，因此不适合在并行开发早期常开。
-
-## 清理工作流
-
-当项目已经不再需要此脚手架工具时：
-
-1. 删除所有 `@[temporary_axiom]`
-2. 确认 `lake env lean TemporaryAxiomAudit.lean` 通过
-3. 运行 dry-run：
+注册库 hash 审计：
 
 ```bash
-python3 scripts/cleanup_temporary_axiom_scaffolding.py
+./scripts/run_approved_statement_registry_audit.sh
 ```
 
-4. 确认输出后执行：
+临时公理清理审计：
+
+```bash
+./scripts/run_temporary_axiom_audit.sh TemporaryAxiomAudit.lean
+```
+
+建议在宿主项目 CI 中加入两个检查：
+
+1. registry 审计，确保已批准陈述未漂移
+2. 最终清理阶段的 `#assert_no_temporary_axioms`
+
+## 清理工具
+
+当宿主项目准备移除全部脚手架时，可使用：
+
+- [scripts/cleanup_temporary_axiom_scaffolding.py](../scripts/cleanup_temporary_axiom_scaffolding.py)
+
+它会：
+
+- 扫描残留的 `@[temporary_axiom]`
+- 在确认已经清空后，删除工具 import、注册表文件、数据库、审计脚本与文档块
+- 可选执行清理后的 `lake build`
+
+常见用法：
 
 ```bash
 python3 scripts/cleanup_temporary_axiom_scaffolding.py --execute
 ```
 
-清理脚本会一并移除：
+## 部署建议
 
-- `TemporaryAxiom` 模块及相关 import
-- `ApprovedStatementRegistry` Lean 模块与生成分片
-- `approved_statement_registry_db/`
-- 审计脚本
-- CI/CD 中用标记包裹的审计步骤
-- 相关文档
+建议把本仓库当作“工具源”来同步到宿主项目，而不是要求用户手工重命名模块前缀。
 
-## 安装与迁移
+宿主项目只需：
 
-当需要迁移此工具时建议至少复制以下内容。
+1. 复制 `TemporaryAxiomTool/`、`approved_statement_registry_db/`、`scripts/`、`templates/`
+2. 在宿主 `lakefile.toml` 里新增 `[[lean_lib]] name = "TemporaryAxiomTool"`
+3. 在业务证明文件里 `import TemporaryAxiomTool.TemporaryAxiom`
+4. 创建自己的 `TemporaryAxiomAudit.lean`
 
-必须迁移的 Lean 文件：
-
-- [TestProject3/TemporaryAxiom.lean](../TestProject3/TemporaryAxiom.lean)
-- [TestProject3/ApprovedStatementRegistry.lean](../TestProject3/ApprovedStatementRegistry.lean)
-- [TestProject3/ApprovedStatementRegistry/Types.lean](../TestProject3/ApprovedStatementRegistry/Types.lean)
-
-初始化时需要准备的自动生成 Lean 产物：
-
-- [TestProject3/ApprovedStatementRegistry/Generated.lean](../TestProject3/ApprovedStatementRegistry/Generated.lean)
-- [TestProject3/ApprovedStatementRegistry/Shards/](../TestProject3/ApprovedStatementRegistry/Shards/)
-
-必须迁移的脚本与外部数据库：
-
-- [scripts/manage_approved_statement_registry.py](../scripts/manage_approved_statement_registry.py)
-- [approved_statement_registry_db/README.md](../approved_statement_registry_db/README.md)
-
-建议一并迁移的辅助文件：
-
-- [TemporaryAxiomAudit.lean](../TemporaryAxiomAudit.lean)
-- [scripts/run_approved_statement_registry_audit.sh](../scripts/run_approved_statement_registry_audit.sh)
-- [scripts/run_temporary_axiom_audit.sh](../scripts/run_temporary_axiom_audit.sh)
-- [scripts/cleanup_temporary_axiom_scaffolding.py](../scripts/cleanup_temporary_axiom_scaffolding.py)
-
-目标项目至少需要准备：
-
-```text
-YourProject/
-  YourProject/TemporaryAxiom.lean
-  YourProject/ApprovedStatementRegistry.lean
-  YourProject/ApprovedStatementRegistry/Types.lean
-  YourProject/ApprovedStatementRegistry/Generated.lean
-  YourProject/ApprovedStatementRegistry/Shards/
-  approved_statement_registry_db/current/
-  approved_statement_registry_db/history/
-  scripts/manage_approved_statement_registry.py
-```
-
-迁移步骤：
-
-1. 复制 Lean 文件到目标项目命名空间下
-2. 把 `TestProject3` 模块前缀统一替换成你的项目名
-3. 检查 Lean 文件中的 `import`、`namespace`
-4. 修改 Python 脚本中的项目常量：
-   - Lean 根目录
-   - build target
-5. 初始化空的 `Generated.lean`、分片目录和外部数据库目录
-6. 在目标项目中需要临时跳过定理的文件里加入：
-
-```lean
-import YourProject.TemporaryAxiom
-```
-
-建议初始 `Generated.lean`：
-
-```lean
-/- Auto-generated registry aggregate. Do not edit by hand. -/
-import YourProject.ApprovedStatementRegistry.Types
-
-namespace YourProject.ApprovedStatementRegistry
-
-def generatedApprovedStatements : Array ApprovedStatement := #[]
-
-end YourProject.ApprovedStatementRegistry
-```
-
-建议首次自检：
-
-```bash
-lake build
-```
-
-```bash
-python3 scripts/manage_approved_statement_registry.py generate --skip-build
-```
-
-```bash
-python3 scripts/manage_approved_statement_registry.py audit
-```
-
-如果迁移了闭环审计文件，再运行：
-
-```bash
-lake env lean TemporaryAxiomAudit.lean
-```
+这样可以最大程度降低接入成本与后续维护成本。

@@ -1,5 +1,5 @@
 import Lean
-import TestProject3.ApprovedStatementRegistry
+import TemporaryAxiomTool.ApprovedStatementRegistry
 
 open Lean Elab Command
 
@@ -17,9 +17,9 @@ open Lean Elab Command
 -/
 syntax (name := Parser.Attr.temporary_axiom) "temporary_axiom" : attr
 
-namespace TemporaryAxiom
+namespace TemporaryAxiomTool
 
-open TestProject3.ApprovedStatementRegistry
+open TemporaryAxiomTool.ApprovedStatementRegistry
 
 /-- `temporary_axiom` 在 parser、attribute 和 label extension 中共享的统一名字。 -/
 def temporaryAxiomAttrName : Name := `temporary_axiom
@@ -194,4 +194,4 @@ elab "#assert_no_temporary_axioms" : command => do
   unless decls.isEmpty do
     throwError m!"temporary axioms remain in the environment ({decls.size}):\n{renderDeclList decls}"
 
-end TemporaryAxiom
+end TemporaryAxiomTool

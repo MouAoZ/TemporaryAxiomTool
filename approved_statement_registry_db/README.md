@@ -1,178 +1,156 @@
 # 已批准陈述注册库数据库
 
-这个目录是 `TemporaryAxiom` 工作流使用的外部数据库。
-它不属于形式化数学库本体，而是一个由脚本维护的注册与审计层。
+这个目录保存 `TemporaryAxiomTool` 的外部注册库。
+
+它不是宿主数学库的一部分，而是由脚本维护的离线数据库层，用来支持：
+
+- 可跳过定理的批准登记
+- statement hash 审计
+- 历史事件回滚
+- review note / warning / alert
+- 历史归档
 
 统一管理入口：
 
-- [scripts/manage_approved_statement_registry.py](../scripts/manage_approved_statement_registry.py)
-
-正常工作流中不要手工编辑这里的 JSON 文件。应优先使用管理脚本，以保证：
-
-- `current/` 与 `history/` 保持一致
-- Lean 侧自动生成的注册表与数据库同步
-- 审计、回滚与人工复核记录完整可追踪
+- [../scripts/manage_approved_statement_registry.py](../scripts/manage_approved_statement_registry.py)
 
 ## 目录结构
 
-- `current/`: 当前已批准陈述快照，按书籍的 chapter/section 分片
-- `history/`: 追加式历史事件日志，记录 `approve`、`commit`、`prune`、`rollback`
-- `archive/`: 由 `history --archive ...` 生成的归档包目录
+- `current/`: 当前批准快照，按 chapter/section 分片
+- `history/`: live 历史事件
+- `archive/`: 归档后的历史事件包
 
-## 分片命名规则
+当前仓库只保留空目录模板，不再附带任何示例 theorem 数据。
 
-当前快照文件名格式：
+## 当前快照文件命名
+
+格式：
 
 - `approved_statement_registry.chapter_<CC>.section_<SS>.json`
 
 示例：
 
-- `approved_statement_registry.chapter_00.section_02.json`
+- `approved_statement_registry.chapter_03.section_02.json`
 
-对应生成的 Lean 分片文件通常为：
+对应 Lean 侧自动生成分片通常位于：
 
-- [TestProject3/ApprovedStatementRegistry/Shards/ApprovedStatementRegistry_Chapter00_Section02.lean](../TestProject3/ApprovedStatementRegistry/Shards/ApprovedStatementRegistry_Chapter00_Section02.lean)
+- [../TemporaryAxiomTool/ApprovedStatementRegistry/Shards/](../TemporaryAxiomTool/ApprovedStatementRegistry/Shards/)
 
-其中：
+## `current/` 顶层结构
 
-- `<CC>` 是两位 chapter 编号
-- `<SS>` 是两位 section 编号
-
-## `current/` 快照格式
-
-每个分片文件都是一个 JSON 对象，顶层字段如下：
-
-- `schema_version`: 数据格式版本号
-- `shard_id`: 分片编号，格式为 `chapter_<CC>.section_<SS>`
-- `chapter`: chapter 编号，整数
-- `section`: section 编号，整数
-- `entries`: 当前分片包含的已批准定理列表
-
-示例骨架：
+每个 shard 文件结构如下：
 
 ```json
 {
   "schema_version": 1,
-  "shard_id": "chapter_00.section_02",
-  "chapter": 0,
+  "shard_id": "chapter_03.section_02",
+  "chapter": 3,
   "section": 2,
   "entries": []
 }
 ```
 
-### `entries` 条目格式
+顶层字段含义：
 
-`entries` 中每个元素对应一个已批准陈述。当前实现中主要字段如下：
+- `schema_version`: 数据格式版本
+- `shard_id`: 分片编号
+- `chapter`: chapter 编号
+- `section`: section 编号
+- `entries`: 当前分片的已批准声明列表
 
-- `decl_name`: Lean 全限定声明名，例如 `TestProject3.SectionMainTheorem_2`
-- `module`: 声明所在 Lean 模块，例如 `TestProject3.Section2`
-- `statement_pretty`: 便于人工审阅的可读陈述
-- 当前按 UTF-8 直接保存可读字符，不再使用 `\uXXXX` 转义
-- `statement_hash`: 当前 elaborated statement 的稳定哈希值，当前实现中以字符串形式存储，例如 `"3056373314800698359"`
-- `needs_human_review`: 是否存在 review note；若存在则为 `true`
-- `review_notes`: 审核备注列表
-- `review_status`: 根据 `review_notes` 聚合出的当前风险等级，当前可取值为 `clear`、`comment`、`warning`、`alert`
+## `entries` 条目字段
+
+每个条目表示一个已批准声明，主要字段如下：
+
+- `decl_name`: Lean 全限定声明名
+- `module`: 声明所属 Lean 模块
+- `statement_pretty`: 供人工审阅的可读陈述
+- `statement_hash`: elaborated statement 的稳定哈希值，当前以字符串形式保存
+- `needs_human_review`: 当前是否存在待人工关注事项
+- `review_notes`: review note 列表
+- `review_status`: 聚合后的风险等级，取值为 `clear`、`comment`、`warning`、`alert`
 - `approved_by`: 最近一次执行 `approve` 的操作者
-- `approval_reason`: 最近一次 `approve` 的原因说明
-- `created_at`: 首次进入注册库的 UTC 时间，格式为 `YYYY-MM-DDTHH:MM:SSZ`
-- `updated_at`: 最近一次被修改的 UTC 时间
-- `approved_at`: 最近一次被 `approve` 的 UTC 时间
+- `approval_reason`: 最近一次 `approve` 的说明
+- `created_at`: 首次进入注册库的时间
+- `updated_at`: 最近一次修改时间
+- `approved_at`: 最近一次批准时间
 
 注意：
 
-- `chapter`、`section`、`shard_id` 只出现在 shard 顶层，不再在每个 entry 中重复保存
-- `module` 已足以标识定理来源的 Lean 模块，因此不再额外保存 `source_file`
-- entry 内部字段顺序固定为“声明标识、陈述信息、审核信息、批准信息、时间信息”
+- `chapter`、`section`、`shard_id` 只保留在 shard 顶层
+- `source_file` 不再保存，因为 `module` 已足够标识来源
 
-## `review_notes` 格式
+## `review_notes`
 
-`review_notes` 是数组。每个元素代表一次 review commit，字段如下：
+`review_notes` 是数组，每个元素表示一次 review commit：
 
 - `event_id`: 对应历史事件编号
-- `timestamp`: 记录时间，UTC 格式 `YYYY-MM-DDTHH:MM:SSZ`
-- `author`: 备注作者
-- `severity`: 风险级别，可取 `comment`、`warning`、`alert`
-- `message`: 备注正文
+- `timestamp`: 时间戳
+- `author`: 记录者
+- `severity`: `comment` / `warning` / `alert`
+- `message`: 备注内容
 
-## `history/` 事件格式
+## `history/` 事件
 
-`history/` 目录中的每个文件都是一个不可变事件，文件名通常就是其 `event_id`：
+`history/` 下每个 JSON 文件都是一个不可变事件，文件名通常即 `event_id`。
 
-- `20260330T084637Z_approve_bbee340b.json`
+顶层字段：
 
-事件顶层字段如下：
+- `schema_version`
+- `event_id`
+- `action`
+- `timestamp`
+- `author`
+- `reason`
+- `changes`
+- `rollback_of`
 
-- `schema_version`: 数据格式版本号
-- `event_id`: 事件编号
-- `action`: 事件动作类型，目前为 `approve`、`commit`、`prune`、`rollback`
-- `timestamp`: 事件发生时间
-- `author`: 事件操作者
-- `reason`: 本次操作的原因说明
-- `changes`: 本次事件涉及的声明变更列表
-- `rollback_of`: 仅在 `rollback` 事件中出现，表示被回滚的原事件编号
+其中 `action` 当前支持：
 
-### `changes` 条目格式
+- `approve`
+- `commit`
+- `prune`
+- `rollback`
 
-`changes` 中每个元素表示一个声明在本次事件中的变化，字段如下：
+### `changes` 字段
 
-- `decl_name`: 被修改的声明名
-- `kind`: 变更类型，例如 `added`、`updated`、`annotated`、`removed`、`rolled_back`
-- `before_shard`: 变更前所在 shard 的定位信息；若原先不存在则省略
-- `after_shard`: 变更后所在 shard 的定位信息；若变更后不存在则省略
-- `before`: 变更前的完整条目；若原先不存在则为 `null`
-- `after`: 变更后的完整条目；若该条目被删除则为 `null`
+`changes` 是数组，每个元素描述一个声明在该事件中的变化：
 
-其中 `before_shard` 和 `after_shard` 都是如下结构：
+- `decl_name`
+- `kind`
+- `before_shard`
+- `after_shard`
+- `before`
+- `after`
 
-```json
-{
-  "shard_id": "chapter_00.section_02",
-  "chapter": 0,
-  "section": 2
-}
-```
+`before_shard` / `after_shard` 用于在不把 shard 信息内嵌到 entry 的前提下，仍然支持稳定回滚。
 
-这使得 `rollback` 可以在 entry 本体不保存 shard 信息的前提下，仍然可靠地做反向重放。
+## `archive/` 归档包
 
-## `archive/` 归档包格式
+`archive/` 下每个 JSON 文件都是一次历史归档操作生成的事件包。
 
-`archive/` 中每个文件都是一次 history 归档操作生成的归档包。文件名格式通常为：
+顶层字段：
 
-- `history_archive.<ARCHIVE_ID>.json`
+- `schema_version`
+- `archive_id`
+- `created_at`
+- `author`
+- `reason`
+- `mode`
+- `decl_filter`
+- `source_event_count`
+- `source_event_ids`
+- `events`
 
-其中 `<ARCHIVE_ID>` 形如：
+归档后：
 
-- `20260331T010203Z_history_archive_ab12cd34`
-
-归档包顶层字段如下：
-
-- `schema_version`: 数据格式版本号
-- `archive_id`: 归档包编号
-- `created_at`: 归档时间
-- `author`: 归档操作者
-- `reason`: 归档原因
-- `mode`: 归档模式，目前为 `decl_filter` 或 `all`
-- `decl_filter`: 仅在按定理过滤归档时出现，记录归档筛选条件
-- `source_event_count`: 被归档的 live 事件数量
-- `source_event_ids`: 被归档事件编号列表
-- `events`: 被归档的完整 history 事件列表
-
-归档包中的 `events` 仍使用与 `history/` 相同的事件结构，因此：
-
-- `history --include-archive` 可以直接读取这些归档事件
-- `rollback --event-id <EVENT_ID>` 可以直接从归档包中找到并回滚已归档事件
-
-注意：
-
-- 归档是“先打包，再从 live history 删除”，不是直接硬删除
-- `history --archive --archive-all --execute` 会清空当前 `history/`，但历史仍保留在 `archive/`
-- 按定理归档时，命中筛选条件的事件会整体进入归档包，以保持事件原子性
+- live `history/` 可以被清空或压缩
+- 旧事件仍可通过 `history --include-archive` 查看
+- `rollback --event-id <EVENT_ID>` 仍可直接从归档包中查找并执行回滚
 
 ## 使用建议
 
-- 日常维护只通过 [scripts/manage_approved_statement_registry.py](../scripts/manage_approved_statement_registry.py) 操作
-- 不在冲突状态下手工拼接 `current/` 和 `history/` 的 JSON
-- 合并冲突后优先保留双方历史事件，再运行 `generate`
-- 若需要检查数据库与 Lean 声明是否一致，运行 `audit`
-- 若需要移除某个已批准定理，运行 `prune`
-- 若需要撤销一次误操作，先用 `history` 找到事件，再执行 `rollback`
+- 不手工编辑这里的 JSON，优先通过脚本维护
+- 合并冲突时优先保留历史事件，再执行 `generate`
+- 定期运行 `audit` 确认 hash 没有漂移
+- 若 live history 过大，可使用 `history --archive ... --execute` 做安全归档
