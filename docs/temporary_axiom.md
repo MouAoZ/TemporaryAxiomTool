@@ -43,6 +43,16 @@
 - `ApprovedStatementRegistry` 负责 statement hash、离线 probe 命令和运行时查找表装配
 - 外部数据库负责 current 快照、人工审核元数据与 statement 版本历史
 
+## 仓库依赖
+
+当前工具源仓库本体只要求 Lean toolchain：
+
+- `leanprover/lean4:v4.29.0-rc8`
+
+当前实现没有额外依赖 `mathlib4`、`checkdecls` 或 `repl`。
+
+如果宿主项目本身依赖这些包，应由宿主项目自己的 `lakefile.toml` 负责声明；工具不会替宿主项目引入它们。
+
 ## Lean 侧语义规格
 
 ### `@[temporary_axiom]` 的处理流程

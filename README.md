@@ -24,11 +24,10 @@
 ## 环境要求
 
 - Lean `v4.29.0-rc8`
-- `mathlib4`
-- `checkdecls`
-- `repl`
 
-依赖声明见 [lakefile.toml](lakefile.toml) 与 [lean-toolchain](lean-toolchain)。
+工具本体当前不依赖额外的 Lake 包；依赖声明见 [lakefile.toml](lakefile.toml) 与 [lean-toolchain](lean-toolchain)。
+
+如果宿主项目本身依赖 `mathlib4` 或其他包，应继续由宿主项目自行声明和管理。
 
 ## 仓库结构
 
