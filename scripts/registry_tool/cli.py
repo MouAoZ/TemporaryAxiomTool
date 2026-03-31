@@ -354,7 +354,7 @@ def main(*, project_root: Path | None = None) -> None:
     args = parser.parse_args()
     if hasattr(args, "decl"):
         ensure_unique_values(args.decl, flag="--decl")
-    if hasattr(args, "module"):
+    if hasattr(args, "module") and isinstance(args.module, list):
         ensure_unique_values(args.module, flag="--module")
     root = project_root if project_root is not None else Path(__file__).resolve().parents[2]
     paths = make_paths(root.resolve())
