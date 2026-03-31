@@ -18,7 +18,7 @@
 
 - `current/`: 当前批准快照，按 chapter/section 分片
 - `history/`: live 历史事件
-- `archive/`: 归档后的历史事件包
+- `archive/`: 归档后的历史事件包, 可以手动删除
 
 当前仓库只保留空目录模板，不再附带任何示例 theorem 数据。
 
@@ -32,9 +32,15 @@
 
 - `approved_statement_registry.chapter_03.section_02.json`
 
-对应 Lean 侧自动生成分片通常位于：
+对应 Lean 侧自动生成文件位于：
 
-- [../TemporaryAxiomTool/ApprovedStatementRegistry/Shards/](../TemporaryAxiomTool/ApprovedStatementRegistry/Shards/)
+- [../TemporaryAxiomTool/ApprovedStatementRegistry/Generated.lean](../TemporaryAxiomTool/ApprovedStatementRegistry/Generated.lean)
+- `../TemporaryAxiomTool/ApprovedStatementRegistry/Shards/` 下的内部分片模块
+
+说明：
+
+- `Generated.lean` 是统一聚合入口
+- `Shards/` 中的文件按 chapter/section 拆分，由脚本自动生成；当 current 快照为空时，该目录可能暂时不存在
 
 ## `current/` 顶层结构
 
