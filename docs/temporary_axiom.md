@@ -1,35 +1,51 @@
-# TemporaryAxiomTool 工作流说明
+# TemporaryAxiomTool 技术规格与工作流说明
 
 ## 目标
 
 `TemporaryAxiomTool` 用于并行形式化中的“定理陈述先批准，证明后补齐”工作流。
 
-核心原则：
+它解决的问题是：
 
-1. 先把可能被下游依赖的 theorem statement 形式化并批准入库
-2. 只有确实需要并行跳过时，才为该 theorem 添加 `@[temporary_axiom]`
-3. `@[temporary_axiom]` 只允许用于已批准陈述
+1. 某个 theorem 的 statement 已经足够可信，允许下游先依赖它
+2. 证明体暂时缺失，但希望在 Lean 中显式、可审计地跳过
+3. 审核者需要快速接手当前批准陈述的人工确认工作
+4. 最终仍需要通过审计确保全部临时公理被清除
 
-因此，这个工具解决的是“证明暂时缺失，但陈述已经可信”的场景，而不是让任意 theorem 都能被静默跳过。
+它不解决的问题是：
+
+- 让任意 theorem 都能静默跳过证明
+- 用外部 JSON 直接影响 Lean 编译结果
+- 代替人工数学审阅
+
+## 术语
+
+- 已批准陈述: 已写入 `approved_statement_registry_db/current/` 的 theorem statement 快照
+- current 快照: 当前仍然有效的批准陈述集合，是活动注册库的唯一真相来源
+- status: 审核者对条目当前可信度的显式判断，取值为 `safe`、`needs_attention`、`unreliable`
+- commit: 审核者留下的人工评论条目；默认覆盖，显式 `--append` 才增量追加
+- history: 仅记录 statement hash 变化的历史目录，不记录 `commit/status` 变更
+- statement hash: 对 theorem elaborated type 计算得到的稳定哈希值，用于比较陈述是否漂移
 
 ## 总体架构
 
 工具由三层组成：
 
-1. Lean 侧临时公理工具：
-   [TemporaryAxiomTool/TemporaryAxiom.lean](../TemporaryAxiomTool/TemporaryAxiom.lean)
-2. Lean 侧批准注册表：
-   [TemporaryAxiomTool/ApprovedStatementRegistry.lean](../TemporaryAxiomTool/ApprovedStatementRegistry.lean)
-3. 外部注册库数据库：
-   [approved_statement_registry_db/README.md](../approved_statement_registry_db/README.md)
+1. Lean 侧临时公理工具:
+   [../TemporaryAxiomTool/TemporaryAxiom.lean](../TemporaryAxiomTool/TemporaryAxiom.lean)
+2. Lean 侧批准注册表:
+   [../TemporaryAxiomTool/ApprovedStatementRegistry.lean](../TemporaryAxiomTool/ApprovedStatementRegistry.lean)
+3. 外部注册库数据库:
+   [../approved_statement_registry_db/README.md](../approved_statement_registry_db/README.md)
 
 职责划分：
 
-- `TemporaryAxiom` 负责 theorem -> axiom 改写与即时合法性检查
-- `ApprovedStatementRegistry` 负责 statement hash、probe 命令和查找表装配
-- 外部数据库负责批准记录、历史事件、review note 与归档
+- `TemporaryAxiom` 负责 theorem -> axiom 改写、属性校验和最终审计命令
+- `ApprovedStatementRegistry` 负责 statement hash、离线 probe 命令和运行时查找表装配
+- 外部数据库负责 current 快照、人工审核元数据与 statement 版本历史
 
-## Lean 侧工作流
+## Lean 侧语义规格
+
+### `@[temporary_axiom]` 的处理流程
 
 当 Lean 读到：
 
@@ -46,82 +62,158 @@ theorem YourProject.someTheorem (h : P ∧ Q) : Q ∧ P := by
 3. macro 丢弃证明体，仅保留声明头，并将 `theorem` 改写为 `axiom`
 4. Lean 对改写后的声明正常 elaboration
 5. attribute 在 `afterTypeChecking` 阶段运行
-6. 工具读取环境中已生成的批准注册表，检查：
-   - 声明名是否已批准
+6. 工具读取当前环境中已经导入的批准注册表，检查：
+   - 声明名是否已被批准
    - 当前 elaborated statement hash 是否与批准记录一致
 
-若不满足条件，报错会在该声明处立刻跳出。
+因此：
+
+- 下游模块看到的是一个真正进入环境的 `axiom`
+- 非法标签会在声明处立即报错，而不是等到下游使用时才失败
+- 运行时只认批准 registry，不认外部 JSON 原始文件
+
+### Lean 运行时实际依赖哪些数据
+
+Lean 编译时不会直接读取外部 JSON 数据库。
+
+运行时只消费由脚本生成的 Lean 模块：
+
+- [../TemporaryAxiomTool/ApprovedStatementRegistry/Generated.lean](../TemporaryAxiomTool/ApprovedStatementRegistry/Generated.lean)
+- `TemporaryAxiomTool/ApprovedStatementRegistry/Shards/` 下的自动生成分片
+
+当前实现中，Lean 运行时真正依赖的批准条目字段只有：
+
+- `decl_name`
+- `statement_hash`
+- `shard_id`
+
+像 `status`、`commit`、`statement_pretty`、`approved_by` 这些字段只服务于离线管理、审计和人工复核，不参与 Lean 运行时判定。
+
+### statement hash 的语义边界
+
+工具比较的不是源代码表面文本，而是 theorem 最终 elaborated type 的哈希值。
+
+原则上：
+
+- 如果最终 elaborated type 相同，则 hash 相同
+- 如果最终 elaborated type 改变，则 hash 改变
+
+下面这些改动通常不会改变 hash：
+
+- 仅重命名 binder 名
+- 只改 pretty-print、换行、注释或 JSON 元数据
+- 只改 notation，但 elaboration 后得到完全相同的类型表达式
+
+下面这些改动通常会改变 hash：
+
+- 改 theorem statement 的 domain、codomain 或中间依赖
+- 改 binder 顺序
+- 改 binder implicitness，例如显式参数改成隐式参数
+- 改 universe 结构
+- 改 namespace 解析或常量解析，导致 elaborated type 指向不同常量
+
+对使用者而言，最安全的理解方式是：
+
+- 不要猜测“这算不算小改动”
+- 只要 theorem header 的语义可能变了，就重新运行 `approve`
 
 ## import 规则
 
 宿主项目普通文件不需要额外 import。
 
-只有需要使用 `@[temporary_axiom]` 的文件需要：
+只有需要使用下列功能的文件才需要：
+
+- `@[temporary_axiom]`
+- `#print_temporary_axioms`
+- `#assert_no_temporary_axioms`
+
+对应导入：
 
 ```lean
 import TemporaryAxiomTool.TemporaryAxiom
 ```
 
-这样可以把工具依赖限制在真正需要跳过证明的模块里。
+## 当前对象模型
 
-## 已批准陈述注册库
+对单个 declaration 而言，可以把它理解为下面几层状态：
 
-外部数据库位于：
+1. 是否已批准
+   - 未批准: 不在 current 快照中，不能使用 `@[temporary_axiom]`
+   - 已批准: 在 current 快照中，可以被 registry 校验
+2. 当前审核状态
+   - `safe`
+   - `needs_attention`
+   - `unreliable`
+3. 当前人工评论
+   - `commit = []`
+   - `commit = [ ... ]`
 
-- `approved_statement_registry_db/current/`
-- `approved_statement_registry_db/history/`
-- `approved_statement_registry_db/archive/`
+注意：
 
-Lean 侧自动生成文件位于：
+- `status` 与 `commit` 互不推导
+- 可以只改 `status` 不写 `commit`
+- 也可以只写 `commit`，保持 `status = safe`
+- `approve` 如果发现 `statement_hash` 改变，会清空旧 `commit` 并把 `status` 设为 `needs_attention`
 
-- `TemporaryAxiomTool/ApprovedStatementRegistry/Generated.lean`
-- `TemporaryAxiomTool/ApprovedStatementRegistry/Shards/` 下的内部 shard 模块
-
-其中：
-
-- `Generated.lean` 是聚合入口，负责 import 各个 chapter/section 分片并导出总表
-- `Shards/` 是脚本自动生成的内部拆分目录；当 current 快照为空时，这个目录可能暂时不存在
-
-数据库格式详见：
-
-- [approved_statement_registry_db/README.md](../approved_statement_registry_db/README.md)
-
-## 管理脚本
+## 管理脚本的定位
 
 统一入口：
 
-- [scripts/manage_approved_statement_registry.py](../scripts/manage_approved_statement_registry.py)
+- [../scripts/manage_approved_statement_registry.py](../scripts/manage_approved_statement_registry.py)
 
-核心命令：
+脚本会根据它自身所在路径自动定位项目根目录，因此正常使用时不需要指定额外的项目根路径参数。
 
-- `approve`: 冻结一个或多个 theorem 的当前陈述
-- `commit`: 给已批准定理追加 review note
-- `prune`: 从注册库移除定理
-- `rollback`: 回滚某个历史事件
-- `history`: 查看或归档历史
-- `audit`: 对照当前 Lean 环境做 hash 审计
-- `generate`: 仅根据 current 快照重建 Lean 侧文件
+正常工作流默认面向人工使用，而不是面向外部程序调用：
 
-查看完整参数：
+- 报表和 history 只提供文本输出
+- `approve`、`prune`、`generate` 会自动重建 Lean 侧 registry 目标
+- 临时审计文件始终自动删除
 
-```bash
-python3 scripts/manage_approved_statement_registry.py --help
-python3 scripts/manage_approved_statement_registry.py approve --help
-```
+## 命令行为规格
 
-通用参数：
+### `approve`
 
-- `--project-root` : Lean 项目根目录路径；接受文件系统路径字符串，默认当前目录 `.`；所有子命令都支持，仅在工具目录不位于当前工作目录时需要显式传入。
+作用：
 
-### 典型 `approve`
+- 通过 Lean 离线 probe 当前 declaration 的 elaborated type
+- 把 statement 快照写入指定 chapter/section shard
+- 重建 Lean 侧 generated registry 文件并重新构建 registry 目标
 
-- `--module` : 用于探测声明的 Lean 模块名；接受 Lean import 路径字符串，例如 `YourProject.Section2`，而不是文件路径；单次命令只接受一个模块，该模块需要能导入本次所有 `--decl`。
-- `--chapter` : 注册库分片所属 chapter 编号；接受十进制整数；单值输入；决定 JSON shard 与生成条目的章节索引。
-- `--section` : 注册库分片所属 section 编号；接受十进制整数；单值输入；与 `--chapter` 一起确定目标 shard。
-- `--decl` : 要批准的定理名；接受 Lean 全限定声明名字符串，例如 `YourProject.someTheorem`, 不推荐短名；支持重复传入；同一命令可一次批准同模块、同 chapter/section 下的多个定理。
-- `--reason` : 审批原因；接受任意简短字符串；单值输入，可省略；省略时默认写入 `approved statement freeze`。
-- `--author` : 历史记录中的操作者；接受字符串；单值输入，可省略；省略时默认写入 `ai-agent`。
-- `--skip-build` : 布尔开关；不接受额外参数；传入后只更新 JSON 与生成文件，不执行 `lake build TemporaryAxiomTool.ApprovedStatementRegistry`。
+状态变化：
+
+- 若 declaration 之前不存在于 current 中，则新增条目
+- 若 declaration 已存在，则原条目会被覆盖更新
+- 若 declaration 原本位于其他 shard，会先从旧 shard 移除，再写入新 shard
+- 若 `statement_hash` 未变化，则保留原有 `status` 与 `commit`
+- 若 `statement_hash` 变化，则清空原有 `commit`，并把 `status` 重置为 `needs_attention`
+- 只有 `statement_hash` 变化时才写入 `history/`
+
+参数说明：
+
+- `--module`
+  - 含义: 用于探测声明的 Lean 模块名
+  - 取值: Lean import 路径字符串，例如 `YourProject.Section2`
+  - 约束: 单次命令只接受一个模块；该模块必须能导入本次所有 `--decl`
+- `--chapter`
+  - 含义: 注册库分片所属 chapter 编号
+  - 取值: 十进制整数
+- `--section`
+  - 含义: 注册库分片所属 section 编号
+  - 取值: 十进制整数
+- `--decl`
+  - 含义: 要批准的定理名
+  - 取值: Lean 全限定声明名字符串，例如 `YourProject.someTheorem`
+  - 约束: 支持重复传入多个不同声明；不允许重复传入同一个值
+- `--reason`
+  - 含义: 审批原因
+  - 取值: 简短字符串
+  - 默认值: `approved statement freeze`
+- `--author`
+  - 含义: 最近一次批准的操作者
+  - 取值: 字符串
+  - 默认值: `ai-agent`
+
+示例：
 
 ```bash
 python3 scripts/manage_approved_statement_registry.py approve \
@@ -131,82 +223,269 @@ python3 scripts/manage_approved_statement_registry.py approve \
   --decl YourProject.someTheorem
 ```
 
-### 典型 `commit`
+批量批准多个不同声明：
 
-- `--decl` : 已批准定理名；接受 Lean 全限定声明名字符串；支持重复传入；可一次给多个已批准定理追加同一条 review note。
-- `--message` : review note 内容；接受字符串；单值输入，必填；用于记录人工关注点、告警或审查意见。
-- `--severity` : review note 严重级别；接受 `comment`、`warning`、`alert` 三选一；单值输入，可省略；默认值为 `warning`。
-- `--reason` : history 中记录的事件原因；接受字符串；单值输入，可省略；省略时会退回使用 `--message` 内容作为事件原因。
-- `--author` : 历史记录中的操作者；接受字符串；单值输入，可省略；省略时默认写入 `ai-agent`。
+```bash
+python3 scripts/manage_approved_statement_registry.py approve \
+  --module YourProject.Section2 \
+  --chapter 3 \
+  --section 2 \
+  --decl YourProject.someTheorem \
+  --decl YourProject.anotherTheorem
+```
+
+### `commit`
+
+作用：
+
+- 更新一个或多个已批准条目的 `status`
+- 覆盖、追加或清理 `commit` 条目
+
+状态变化：
+
+- 不改变 `statement_hash`
+- 不写任何 `history/` 文件
+- 会更新 current 快照中的人工审核元数据
+
+参数说明：
+
+- `--decl`
+  - 含义: 已批准定理名
+  - 取值: Lean 全限定声明名字符串
+  - 约束: 支持重复传入多个不同声明；不允许重复传入同一个值
+- `--status`
+  - 含义: 显式设置审核状态
+  - 取值: `safe`、`needs_attention`、`unreliable`
+- `--message`
+  - 含义: 要写入的人工评论
+  - 取值: 字符串
+  - 说明: 默认会覆盖该条目的整个 `commit` 列表
+- `--append`
+  - 含义: 追加一条 `commit`，而不是覆盖
+  - 类型: 布尔开关
+  - 约束: 必须和 `--message` 一起使用
+- `--clear`
+  - 含义: 清空该条目的全部 `commit`
+  - 类型: 布尔开关
+- `--drop`
+  - 含义: 删除该条目中指定序号的 `commit`
+  - 取值: 1-based 正整数
+- `--author`
+  - 含义: 写入 `commit` 元数据的操作者
+  - 取值: 字符串
+  - 默认值: `ai-agent`
+
+常见用法：
+
+覆盖式提交：
 
 ```bash
 python3 scripts/manage_approved_statement_registry.py commit \
   --decl YourProject.someTheorem \
-  --severity warning \
-  --message "binder names changed recently; manual review recommended"
+  --status needs_attention \
+  --message "binder order changed; manual review suggested"
 ```
 
-### 典型 `prune`
+增量追加：
 
-- `--decl` : 要从已批准陈述注册库中移除的定理名；接受 Lean 全限定声明名字符串；支持重复传入；适合批量剔除同一轮不再可信的陈述。
-- `--reason` : 移除原因；接受字符串；单值输入，可省略；省略时默认写入 `removed from approved statement registry`。
-- `--author` : 历史记录中的操作者；接受字符串；单值输入，可省略；省略时默认写入 `ai-agent`。
-- `--skip-build` : 布尔开关；不接受额外参数；传入后跳过 registry Lean 侧重建与构建。
+```bash
+python3 scripts/manage_approved_statement_registry.py commit \
+  --decl YourProject.someTheorem \
+  --append \
+  --message "secondary reviewer confirmed issue scope"
+```
+
+仅改状态：
+
+```bash
+python3 scripts/manage_approved_statement_registry.py commit \
+  --decl YourProject.someTheorem \
+  --status unreliable
+```
+
+清空全部 `commit`：
+
+```bash
+python3 scripts/manage_approved_statement_registry.py commit \
+  --decl YourProject.someTheorem \
+  --clear
+```
+
+删除第 2 条 `commit`：
+
+```bash
+python3 scripts/manage_approved_statement_registry.py commit \
+  --decl YourProject.someTheorem \
+  --drop 2
+```
+
+### `report`
+
+作用：
+
+- 为人工审核者快速打印当前条目
+
+默认行为：
+
+- 在不额外传入 `--all`、`--decl`、`--status` 时，只打印 `commit` 非空的条目
+- 默认字段为 `decl_name`、`status`、`statement_pretty`、全部 `commit`
+
+参数说明：
+
+- `--decl`
+  - 含义: 精确声明名过滤
+  - 取值: Lean 全限定声明名字符串
+  - 约束: 支持重复传入多个不同声明；不允许重复传入同一个值
+- `--status`
+  - 含义: 状态过滤
+  - 取值: `safe`、`needs_attention`、`unreliable`
+  - 约束: 支持重复传入
+- `--all`
+  - 含义: 打印全部 current 条目，而不是默认的“仅有 commit 的条目”
+  - 类型: 布尔开关
+- `--verbose`
+  - 含义: 追加打印 `module`、`shard`、`approval_reason`
+  - 类型: 布尔开关
+- `--lifecycle`
+  - 含义: 再追加打印生命周期元数据
+  - 类型: 布尔开关
+
+示例：
+
+```bash
+python3 scripts/manage_approved_statement_registry.py report
+```
+
+```bash
+python3 scripts/manage_approved_statement_registry.py report \
+  --status needs_attention \
+  --verbose \
+  --lifecycle
+```
+
+### `audit`
+
+作用：
+
+- 重新 probe current 中的声明
+- 比较注册库里的 `statement_hash` 与当前 Lean 环境中的真实 hash
+- 若存在 `status != safe` 或 `commit` 非空的条目，会额外打印摘要提示，便于人工复核
+
+参数说明：
+
+- `--decl`
+  - 含义: 审计范围过滤
+  - 取值: Lean 全限定声明名字符串
+  - 约束: 支持重复传入多个不同声明；省略时审计 current 中全部声明
+- `--fail-on-status`
+  - 含义: 审核状态阈值
+  - 取值: `needs_attention`、`unreliable`
+  - 作用: 若任一被选中条目的 `status` 达到或超过该级别，则命令失败
+
+示例：
+
+```bash
+python3 scripts/manage_approved_statement_registry.py audit
+```
+
+```bash
+python3 scripts/manage_approved_statement_registry.py audit --fail-on-status needs_attention
+```
+
+### `audit-temporary-axioms`
+
+作用：
+
+- 临时生成一个 Lean 审计入口文件
+- 导入 `TemporaryAxiomTool.TemporaryAxiom`
+- 导入你通过 `--module` 传入的宿主模块
+- 执行 `#assert_no_temporary_axioms`
+- 审计结束后自动删除临时文件
+
+参数说明：
+
+- `--module`
+  - 含义: 导入到临时审计入口中的 Lean 模块
+  - 取值: Lean import 路径字符串
+  - 约束: 支持重复传入多个不同模块；至少需要提供一个；不允许重复值
+
+示例：
+
+```bash
+python3 scripts/manage_approved_statement_registry.py audit-temporary-axioms \
+  --module YourProject
+```
+
+### `prune`
+
+作用：
+
+- 从 current 快照中移除一个或多个声明
+- 重建 Lean 侧 generated registry 文件并重新构建 registry 目标
+
+参数说明：
+
+- `--decl`
+  - 含义: 要移除的定理名
+  - 取值: Lean 全限定声明名字符串
+  - 约束: 支持重复传入多个不同声明；不允许重复传入同一个值
+
+示例：
 
 ```bash
 python3 scripts/manage_approved_statement_registry.py prune \
   --decl YourProject.someTheorem
 ```
 
-### 典型 `audit`
+### `history`
 
-- `--decl` : 审计范围过滤；接受 Lean 全限定声明名字符串；支持重复传入；省略时审计当前注册库中的全部定理。
-- `--fail-on-review-status` : review 状态阈值；接受 `comment`、`warning`、`alert` 三选一；单值输入，可省略；传入后，如果任一被选中定理的 `review_status` 不低于该阈值，则命令以失败退出，适合接入 CI。
+作用：
+
+- 查看 statement hash 变化历史
+
+注意：
+
+- `history/` 只记录 statement hash 变化
+- 改 `status` 或 `commit` 不会写入 `history/`
+
+参数说明：
+
+- `--decl`
+  - 含义: 声明名过滤
+  - 取值: Lean 全限定声明名字符串
+  - 约束: 支持重复传入多个不同声明；不允许重复传入同一个值
+- `--limit`
+  - 含义: 输出条数上限
+  - 取值: 十进制整数
+- `--verbose`
+  - 含义: 打印 shard 与 before/after statement
+  - 类型: 布尔开关
+
+示例：
 
 ```bash
-python3 scripts/manage_approved_statement_registry.py audit
+python3 scripts/manage_approved_statement_registry.py history
 ```
-
-### 典型 `history`
-
-- `--decl` : history 过滤条件；接受 Lean 全限定声明名字符串；支持重复传入；在浏览模式下用于缩小输出范围，在归档模式下用于选择待归档事件。
-- `--limit` : 输出条数上限；接受十进制整数；单值输入，可省略；仅用于普通 history 浏览，不可与 `--archive` 混用。
-- `--include-archive` : 布尔开关；不接受额外参数；浏览 history 时同时读取 `archive/` 中的归档包。
-- `--archive-only` : 布尔开关；不接受额外参数；浏览时只显示归档包中的事件。
-- `--archive` : 布尔开关；不接受额外参数；把匹配到的 live history 事件打包归档到 `approved_statement_registry_db/archive/`。
-- `--archive-all` : 布尔开关；不接受额外参数；仅在 `--archive` 模式下使用；表示归档全部 live history，而不是用 `--decl` 选择子集。
-- `--reason` : 归档原因；接受字符串；单值输入，可省略；仅在 `--archive` 模式下写入 archive bundle 元数据；省略时脚本会自动生成默认说明。
-- `--author` : 归档操作者；接受字符串；单值输入，可省略；默认 `ai-agent`；仅在 `--archive` 模式下写入 archive bundle 元数据。
-- `--execute` : 布尔开关；不接受额外参数；仅在 `--archive` 模式下有意义；不传时 `--archive` 只做 dry run。
-
-```bash
-python3 scripts/manage_approved_statement_registry.py history --include-archive
-```
-
-典型归档：
 
 ```bash
 python3 scripts/manage_approved_statement_registry.py history \
-  --archive \
   --decl YourProject.someTheorem \
-  --execute
+  --verbose
 ```
 
-### 典型 `rollback`
+### `generate`
 
-- `--event-id` : 要回滚的历史事件编号；接受完整 event id 字符串，例如 `20260331T010203Z_approve_ab12cd34`；单值输入；会同时在 live history 与 archive 中查找。
-- `--reason` : 回滚原因；接受字符串；单值输入，可省略；省略时默认写入 `rollback of <EVENT_ID>`。
-- `--author` : 历史记录中的操作者；接受字符串；单值输入，可省略；默认 `ai-agent`。
-- `--skip-build` : 布尔开关；不接受额外参数；传入后跳过回滚后的 Lean registry 构建。
+作用：
 
-```bash
-python3 scripts/manage_approved_statement_registry.py rollback \
-  --event-id 20260331T010203Z_approve_ab12cd34
-```
+- 仅根据 `approved_statement_registry_db/current/` 重写 Lean 侧生成文件
+- 随后重新构建 registry 目标
 
-### 典型 `generate`
+适用场景：
 
-- `--skip-build` : 布尔开关；不接受额外参数；传入后只根据 `approved_statement_registry_db/current/` 重写生成文件，不执行后续 `lake build`。
+- 当前快照是对的，但生成出来的 Lean 文件丢了或不同步
+- 你手工修复了 current 中的 JSON，需要重新生成 Lean 侧 registry
+
+示例：
 
 ```bash
 python3 scripts/manage_approved_statement_registry.py generate
@@ -214,112 +493,32 @@ python3 scripts/manage_approved_statement_registry.py generate
 
 ## 审计与 CI/CD
 
-注册库 hash 审计：
+建议在宿主项目 CI 中至少加入两个检查：
 
-```bash
-./scripts/run_approved_statement_registry_audit.sh
-```
-
-临时公理清理审计：
-
-```bash
-./scripts/run_temporary_axiom_audit.sh --module YourProject
-```
-
-这个脚本会临时生成一个 Lean 审计入口，并导入你通过 `--module` 传入的宿主模块。
-如果项目没有单一根模块，可以重复传入多个 `--module`。
-
-参数说明：
-
-- `--module` : 要导入到临时审计入口中的 Lean 模块；接受 Lean import 路径字符串；支持重复传入；至少需要提供一个，推荐传项目根模块或所有可能引入 `temporary_axiom` 的 section 根模块。
-- `TEMPORARY_AXIOM_KEEP_GENERATED_AUDIT=1` : 环境变量开关；不属于命令行参数；设置后保留脚本生成的临时审计 `.lean` 文件，便于排查 import 或环境问题。
-
-建议在宿主项目 CI 中加入两个检查：
-
-1. registry 审计，确保已批准陈述未漂移
-2. 最终清理阶段的 `#assert_no_temporary_axioms`
+1. registry hash 审计
+2. temporary axiom 闭包审计
 
 例如：
 
 ```yaml
-- name: Temporary axiom audit
-  run: ./scripts/run_temporary_axiom_audit.sh --module YourProject
-```
+- name: Approved statement registry audit
+  run: python3 scripts/manage_approved_statement_registry.py audit
 
-如果需要覆盖多个 section 根模块：
-
-```yaml
 - name: Temporary axiom audit
   run: |
-    ./scripts/run_temporary_axiom_audit.sh \
-      --module YourProject.Section2 \
-      --module YourProject.Section3
+    python3 scripts/manage_approved_statement_registry.py \
+      audit-temporary-axioms \
+      --module YourProject
 ```
 
-如果你希望 cleanup 脚本后续自动移除这些审计步骤，请把相关 workflow block
-包在下面的 marker 中：
+## 最终清理建议
 
-```yaml
-# approved-statement-registry-audit:start
-- name: Approved statement registry audit
-  run: ./scripts/run_approved_statement_registry_audit.sh
-# approved-statement-registry-audit:end
+当前版本不再提供自动 cleanup 脚本。
 
-# temporary-axiom-audit:start
-- name: Temporary axiom audit
-  run: ./scripts/run_temporary_axiom_audit.sh --module YourProject
-# temporary-axiom-audit:end
-```
+推荐的人工退场流程是：
 
-如果 workflow 里仍然存在未加 marker 的审计脚本调用，cleanup 会直接报错并拒绝继续，
-避免在删除脚手架后留下失效的 CI 引用。
-
-## 清理工具
-
-当宿主项目准备移除全部脚手架时，可使用：
-
-- [scripts/cleanup_temporary_axiom_scaffolding.py](../scripts/cleanup_temporary_axiom_scaffolding.py)
-
-它会：
-
-- 扫描残留的 `@[temporary_axiom]`
-- 在确认已经清空后，删除工具 import、注册表文件、数据库、审计脚本与文档块
-- 同步清理 `lakefile.toml` 中 `TemporaryAxiomTool` 对应的 `lean_lib` 与 `defaultTargets` 引用
-- 在执行真实删除前先运行一次模块级审计
-- 修改失败时自动回滚文件与目录改动
-- 可选执行清理后的 `lake build`
-
-常见用法：
-
-```bash
-python3 scripts/cleanup_temporary_axiom_scaffolding.py \
-  --audit-module YourProject \
-  --execute
-```
-
-如果项目没有单一根模块，可以重复传入多个 `--audit-module`。
-只有显式加上 `--skip-audit` 时，脚本才会跳过这一步预检查。
-
-关键参数：
-
-- `--project-root` : 要清理的 Lean 项目根目录；接受文件系统路径字符串；单值输入；默认当前目录。
-- `--audit-module` : 清理前预审计要导入的 Lean 模块；接受 Lean import 路径字符串；支持重复传入；除非使用 `--skip-audit`，否则至少应提供一个。
-- `--workflow-file` : 要扫描与清理的 workflow 文件；接受相对项目根目录的路径字符串；支持重复传入；省略时默认扫描 `.github/workflows/` 下全部 `.yml/.yaml` 文件。
-- `--execute` : 布尔开关；不接受额外参数；不传时只输出清理计划，传入后才真正写文件和删除脚手架。
-- `--skip-audit` : 布尔开关；不接受额外参数；跳过清理前的 `#assert_no_temporary_axioms` 检查。
-- `--skip-build` : 布尔开关；不接受额外参数；跳过清理后的 `lake build` 验证。
-- `--keep-docs` : 布尔开关；不接受额外参数；保留 `docs/temporary_axiom.md`，并在宿主 README 使用了可移除 marker 时保留对应文档块。
-- `--audit-script`、`--readme-file`、`--lakefile`、`--utility-module` : 这些是高级定制参数；接受路径或模块名字符串；主要用于把脚本迁移到非默认布局的宿主项目时覆写默认路径。
-
-## 部署建议
-
-建议把本仓库当作“工具源”来同步到宿主项目，而不是要求用户手工重命名模块前缀。
-
-宿主项目只需：
-
-1. 复制 `TemporaryAxiomTool/`、`approved_statement_registry_db/`、`scripts/`
-2. 在宿主 `lakefile.toml` 里新增 `[[lean_lib]] name = "TemporaryAxiomTool"`
-3. 在业务证明文件里 `import TemporaryAxiomTool.TemporaryAxiom`
-4. 在 CI 或收尾阶段用 `run_temporary_axiom_audit.sh --module ...` 做模块级审计
-
-这样可以最大程度降低接入成本与后续维护成本。
+1. 运行 `audit-temporary-axioms`，确认已经没有 `@[temporary_axiom]`
+2. 删除业务文件中的 `import TemporaryAxiomTool...`
+3. 从宿主 `lakefile.toml` 中移除 `TemporaryAxiomTool` 对应 `lean_lib`
+4. 删除同步进去的 `TemporaryAxiomTool/`、`approved_statement_registry_db/` 与 `scripts/`
+5. 重新 `lake build` 验证宿主项目已经脱离工具依赖

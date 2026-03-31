@@ -1,63 +1,82 @@
 # TemporaryAxiomTool
 
-`TemporaryAxiomTool` 是一个可迁移的 Lean 工具包，用于并行形式化中的“定理临时公理化”工作流。
+`TemporaryAxiomTool` 是一个面向 Lean 4 并行形式化的工具库，用来管理“先冻结 theorem statement，后补证明”的工作流。
 
-它提供三部分能力：
+它的核心约束是：
 
-- Lean 侧 `@[temporary_axiom]` 宏与即时校验
-- 外部已批准陈述注册库与历史/归档机制
-- 审计、清理与 CI/CD 接入脚本
+- 只有已经进入批准注册库的陈述，才允许被标记为 `@[temporary_axiom]`
+- Lean 会在声明通过 elaboration 后立即校验 statement hash，防止陈述漂移
+- 人工审核元数据与 statement 版本历史分离管理
+- 项目收尾时必须通过审计确认临时公理全部移除
 
-这个分支已经剔除了测试项目本身，只保留工具骨架、空注册库模板、脚本和文档，适合作为其他形式化项目的部署源。
+这个仓库提供的是可复用工具本体，而不是某个具体形式化项目的示例工程。
+
+完整技术规格见 [docs/temporary_axiom.md](docs/temporary_axiom.md)，
+数据库格式说明见 [approved_statement_registry_db/README.md](approved_statement_registry_db/README.md)。
+
+## 核心能力
+
+- Lean 侧 `@[temporary_axiom]` 宏、属性校验与最终审计命令
+- 外部已批准陈述注册库，以及对应的 Lean 侧自动生成 registry 模块
+- 单入口管理脚本，支持 `approve`、`commit`、`report`、`audit`、`history`
+- statement hash 变化历史记录，与人工审核元数据分离
+
+## 环境要求
+
+- Lean `v4.29.0-rc8`
+- `mathlib4`
+- `checkdecls`
+- `repl`
+
+依赖声明见 [lakefile.toml](lakefile.toml) 与 [lean-toolchain](lean-toolchain)。
 
 ## 仓库结构
 
-- [TemporaryAxiomTool.lean](TemporaryAxiomTool.lean)
-- [TemporaryAxiomTool/TemporaryAxiom.lean](TemporaryAxiomTool/TemporaryAxiom.lean)
-- [TemporaryAxiomTool/ApprovedStatementRegistry.lean](TemporaryAxiomTool/ApprovedStatementRegistry.lean)
-- [TemporaryAxiomTool/ApprovedStatementRegistry/Types.lean](TemporaryAxiomTool/ApprovedStatementRegistry/Types.lean)
-- [TemporaryAxiomTool/ApprovedStatementRegistry/Generated.lean](TemporaryAxiomTool/ApprovedStatementRegistry/Generated.lean)
-- [approved_statement_registry_db/](approved_statement_registry_db/)
-- [scripts/manage_approved_statement_registry.py](scripts/manage_approved_statement_registry.py)
-- [scripts/run_approved_statement_registry_audit.sh](scripts/run_approved_statement_registry_audit.sh)
-- [scripts/run_temporary_axiom_audit.sh](scripts/run_temporary_axiom_audit.sh)
-- [scripts/cleanup_temporary_axiom_scaffolding.py](scripts/cleanup_temporary_axiom_scaffolding.py)
-- [docs/temporary_axiom.md](docs/temporary_axiom.md)
+- [TemporaryAxiomTool.lean](TemporaryAxiomTool.lean): 库根模块
+- [TemporaryAxiomTool/TemporaryAxiom.lean](TemporaryAxiomTool/TemporaryAxiom.lean): `@[temporary_axiom]` 宏、属性与审计命令
+- [TemporaryAxiomTool/ApprovedStatementRegistry.lean](TemporaryAxiomTool/ApprovedStatementRegistry.lean): 注册表入口
+- [TemporaryAxiomTool/ApprovedStatementRegistry/Types.lean](TemporaryAxiomTool/ApprovedStatementRegistry/Types.lean): 注册表数据类型
+- [TemporaryAxiomTool/ApprovedStatementRegistry/Generated.lean](TemporaryAxiomTool/ApprovedStatementRegistry/Generated.lean): 自动生成的注册表聚合模块
+- [approved_statement_registry_db/](approved_statement_registry_db/): 外部注册库数据库
+- [scripts/manage_approved_statement_registry.py](scripts/manage_approved_statement_registry.py): 唯一 CLI 入口
+- [scripts/registry_tool/](scripts/registry_tool/): CLI 的内部实现模块
+- [docs/temporary_axiom.md](docs/temporary_axiom.md): 完整技术规格与工作流说明
 
-## 快速部署
+## 接入宿主项目
 
-推荐把以下路径复制或同步到宿主 Lean 项目根目录：
+当前仓库的设计偏向将工具文件直接同步到宿主 Lean 项目根目录。最小接入集合通常包括：
 
 - `TemporaryAxiomTool.lean`
 - `TemporaryAxiomTool/`
 - `approved_statement_registry_db/`
 - `scripts/manage_approved_statement_registry.py`
-- `scripts/run_approved_statement_registry_audit.sh`
-- `scripts/run_temporary_axiom_audit.sh`
-- `scripts/cleanup_temporary_axiom_scaffolding.py`
+- `scripts/registry_tool/`
 - `docs/temporary_axiom.md`
 
-然后在宿主项目的 `lakefile.toml` 中加入一个额外的 `lean_lib`：
+然后在宿主项目的 `lakefile.toml` 中加入：
 
 ```toml
 [[lean_lib]]
 name = "TemporaryAxiomTool"
 ```
 
-如果宿主项目原本没有 `approved_statement_registry_db/`，直接保留这里的空目录模板即可。
+接入后建议先构建一次：
 
-收尾清理时，`scripts/cleanup_temporary_axiom_scaffolding.py` 会尝试同步移除
-这个 `lean_lib` block，以及 `defaultTargets` 中对 `TemporaryAxiomTool` 的引用。
+```bash
+lake build TemporaryAxiomTool
+```
 
-## 宿主项目接入
+管理脚本会根据它自身所在路径自动定位项目根目录，因此正常使用时不需要再额外指定项目根路径参数。
 
-在需要跳过证明的 Lean 文件中：
+## 最小使用方式
+
+只有需要跳过证明的 Lean 文件才需要导入：
 
 ```lean
 import TemporaryAxiomTool.TemporaryAxiom
 ```
 
-把需要跳过的 theorem 写成：
+将 theorem 写成：
 
 ```lean
 @[temporary_axiom]
@@ -65,46 +84,14 @@ theorem YourProject.someTheorem (h : P ∧ Q) : Q ∧ P := by
   sorry
 ```
 
-但只有在该 theorem 的陈述已经被批准写入注册库后，这个标签才会通过校验。
+该声明会在语法层被改写为 `axiom`，但只有当下面两项都成立时才会通过校验：
 
-## 临时公理审计
+- `YourProject.someTheorem` 已经存在于已批准陈述注册库中
+- 当前 elaborated statement hash 与批准记录一致
 
-不再需要维护一个固定的 `TemporaryAxiomAudit.lean` 文件。
+## 典型工作流
 
-审计脚本会临时生成一个 Lean 入口文件，导入 `TemporaryAxiomTool.TemporaryAxiom`
-和你指定的宿主模块，然后执行 `#assert_no_temporary_axioms`。
-
-典型用法：
-
-```bash
-./scripts/run_temporary_axiom_audit.sh --module YourProject
-```
-
-如果项目没有单一根模块，可以重复传入多个模块：
-
-```bash
-./scripts/run_temporary_axiom_audit.sh \
-  --module YourProject.Section2 \
-  --module YourProject.Section3
-```
-
-若想检查脚本生成的临时审计文件，可设置：
-
-```bash
-TEMPORARY_AXIOM_KEEP_GENERATED_AUDIT=1 ./scripts/run_temporary_axiom_audit.sh --module YourProject
-```
-
-如果你希望后续 `cleanup_temporary_axiom_scaffolding.py` 自动移除 CI 中的审计步骤，
-需要把对应 workflow block 用文档中约定的 marker 包起来。具体格式见
-[docs/temporary_axiom.md](docs/temporary_axiom.md) 的 “审计与 CI/CD” 一节。
-
-## 注册库管理
-
-统一入口：
-
-- [scripts/manage_approved_statement_registry.py](scripts/manage_approved_statement_registry.py)
-
-最常用命令：
+### 1. 批准陈述
 
 ```bash
 python3 scripts/manage_approved_statement_registry.py approve \
@@ -114,61 +101,130 @@ python3 scripts/manage_approved_statement_registry.py approve \
   --decl YourProject.someTheorem
 ```
 
+同一条命令可以重复传入多个不同的 `--decl`，但不允许把同一个声明名重复传入两次。
+
+### 2. 在需要时写入审核元数据
+
+默认覆盖该条目的 `commit` 列表，并可同步设置 `status`：
+
+```bash
+python3 scripts/manage_approved_statement_registry.py commit \
+  --decl YourProject.someTheorem \
+  --status needs_attention \
+  --message "binder order changed; manual review suggested"
+```
+
+需要增量追加时显式使用 `--append`：
+
+```bash
+python3 scripts/manage_approved_statement_registry.py commit \
+  --decl YourProject.someTheorem \
+  --append \
+  --message "secondary reviewer confirmed issue scope"
+```
+
+清空全部评论：
+
+```bash
+python3 scripts/manage_approved_statement_registry.py commit \
+  --decl YourProject.someTheorem \
+  --clear
+```
+
+### 3. 为人工审核者生成报告
+
+默认在不额外传入 `--all`、`--decl`、`--status` 时，只打印 `commit` 非空的条目：
+
+```bash
+python3 scripts/manage_approved_statement_registry.py report
+```
+
+如需完整查看，可使用：
+
+```bash
+python3 scripts/manage_approved_statement_registry.py report --all --verbose --lifecycle
+```
+
+### 4. 审计注册库
+
 ```bash
 python3 scripts/manage_approved_statement_registry.py audit
 ```
 
-```bash
-python3 scripts/manage_approved_statement_registry.py history --include-archive
-```
+如果想把非安全状态直接视为失败，可使用：
 
 ```bash
-python3 scripts/manage_approved_statement_registry.py rollback --event-id <EVENT_ID>
+python3 scripts/manage_approved_statement_registry.py audit --fail-on-status needs_attention
 ```
 
-## 文档
-
-- 工具工作流说明：[docs/temporary_axiom.md](docs/temporary_axiom.md)
-- 注册库数据库格式：[approved_statement_registry_db/README.md](approved_statement_registry_db/README.md)
-
-## 发布到 GitHub
-
-当前仓库尚未配置远端。
-
-发布前建议：
-
-1. 将本地目录名与 GitHub 仓库名统一为 `TemporaryAxiomTool`
-2. 在 GitHub 上创建空仓库 `TemporaryAxiomTool`
-3. 为本地仓库添加远端并推送
-
-SSH 示例：
+### 5. 查看 statement 变化历史
 
 ```bash
-git remote add origin git@github.com:<YOUR_ACCOUNT>/TemporaryAxiomTool.git
-git push -u origin <YOUR_BRANCH>
+python3 scripts/manage_approved_statement_registry.py history
 ```
 
-HTTPS 示例：
+只看某个声明：
 
 ```bash
-git remote add origin https://github.com/<YOUR_ACCOUNT>/TemporaryAxiomTool.git
-git push -u origin <YOUR_BRANCH>
+python3 scripts/manage_approved_statement_registry.py history \
+  --decl YourProject.someTheorem \
+  --verbose
 ```
 
-如果你打算把当前分支作为默认发布分支，可以先改名后再推送：
+### 6. 审计剩余临时公理
 
 ```bash
-git branch -M main
-git push -u origin main
+python3 scripts/manage_approved_statement_registry.py audit-temporary-axioms \
+  --module YourProject
 ```
 
-## 本仓库的定位
+若项目没有单一根模块，可重复传入多个不同的 `--module`。
 
-这个仓库现在是“工具源仓库”，不是业务形式化工程本体。
+### 7. 修复生成文件
 
-因此：
+正常工作流里，`approve` 和 `prune` 会自动重建 Lean 侧 registry 文件。
 
-- 默认注册库是空的
-- `Generated.lean` 是空聚合文件
-- `approved_statement_registry_db/current/`、`history/`、`archive/` 只保留模板目录
-- 宿主项目的 theorem、section 与最终主定理不再包含在这里
+如果你只是想根据当前 `approved_statement_registry_db/current/` 重新生成 Lean 侧文件，可使用：
+
+```bash
+python3 scripts/manage_approved_statement_registry.py generate
+```
+
+### 8. 最终手动清理脚手架
+
+当前版本不再提供自动 cleanup 脚本。推荐在最终收尾阶段完成下面几步：
+
+1. 确认 `audit-temporary-axioms` 已通过
+2. 删除业务文件中不再需要的 `import TemporaryAxiomTool...`
+3. 从 `lakefile.toml` 中移除 `TemporaryAxiomTool` 对应的 `lean_lib`
+4. 删除工具目录、注册库目录和本仓库同步进去的脚本
+5. 重新 `lake build` 验证宿主项目已摆脱工具依赖
+
+## 命令概览
+
+[scripts/manage_approved_statement_registry.py](scripts/manage_approved_statement_registry.py) 提供统一入口，常用子命令如下：
+
+- `approve`: 将当前 theorem statement 批准写入指定 chapter/section 分片
+- `commit`: 更新人工审核 `commit` 与 `status`
+- `report`: 为人工审核者打印当前条目
+- `audit`: 对照当前 Lean 环境核对 statement hash
+- `audit-temporary-axioms`: 临时生成审计入口并运行 `#assert_no_temporary_axioms`
+- `prune`: 从注册库中移除不再可信的陈述
+- `history`: 查看 statement hash 变化历史
+- `generate`: 仅根据 `approved_statement_registry_db/current/` 重建 Lean 侧生成文件
+
+查看完整参数：
+
+```bash
+python3 scripts/manage_approved_statement_registry.py --help
+python3 scripts/manage_approved_statement_registry.py approve --help
+python3 scripts/manage_approved_statement_registry.py commit --help
+```
+
+## 当前仓库状态
+
+这是一个工具源仓库，因此默认只保留可复用骨架：
+
+- `approved_statement_registry_db/current/` 与 `history/` 为空模板目录
+- [TemporaryAxiomTool/ApprovedStatementRegistry/Generated.lean](TemporaryAxiomTool/ApprovedStatementRegistry/Generated.lean) 是空聚合入口
+- 仓库中不包含任何宿主项目的 theorem 数据或业务形式化内容
