@@ -22,7 +22,6 @@ from .lean_ops import (
     build_registry,
     generate_lean_registry,
     probe_declarations,
-    run_command,
     run_temporary_axiom_audit,
 )
 
@@ -34,6 +33,7 @@ def fail_missing_registry_decl(decl_name: str, *, action: str) -> None:
 
 
 def ensure_unique_values(values: list[str], *, flag: str) -> None:
+    # 对 repeatable flag 提前去重，避免一个命令里重复操作同一声明或模块。
     seen: set[str] = set()
     duplicates: list[str] = []
     for value in values:
@@ -44,8 +44,13 @@ def ensure_unique_values(values: list[str], *, flag: str) -> None:
         raise SystemExit(f"`{flag}` 不允许重复值：{', '.join(duplicates)}")
 
 
+def rebuild_registry_artifacts(paths) -> None:
+    generate_lean_registry(paths)
+    build_registry(paths)
+
+
 def approve_entries(args: argparse.Namespace, paths) -> None:
-    run_command(paths, ["lake", "build", paths.build_target], f"构建 `{paths.build_target}`")
+    build_registry(paths)
     probed = probe_declarations(paths, args.module, args.decl)
     shards = load_current_shards(paths)
     index = index_entries(shards)
@@ -58,6 +63,7 @@ def approve_entries(args: argparse.Namespace, paths) -> None:
         before_key = index[decl_name][0] if decl_name in index else None
         if before_key is not None and before_key != target_key:
             remove_entry(shards, before_key, decl_name)
+        # 只有 statement 漂移才清空人工 comment、重置状态并写 history。
         hash_changed = before is not None and before["statement_hash"] != payload["statement_hash"]
         after = {
             "decl_name": decl_name,
@@ -85,8 +91,8 @@ def approve_entries(args: argparse.Namespace, paths) -> None:
                 after=after,
             )
     save_current_shards(paths, shards)
-    generate_lean_registry(paths)
-    build_registry(paths)
+    # 每次改动 current 后立即重建 Lean 侧镜像，避免 JSON 与生成物脱节。
+    rebuild_registry_artifacts(paths)
     print(f"Approved {len(probed)} declaration(s) into {args.chapter:02d}.{args.section:02d}.")
     if history_count > 0:
         print(f"Recorded {history_count} statement-history update(s).")
@@ -143,13 +149,12 @@ def prune_entries(args: argparse.Namespace, paths) -> None:
         remove_entry(shards, key, decl_name)
         removed += 1
     save_current_shards(paths, shards)
-    generate_lean_registry(paths)
-    build_registry(paths)
+    rebuild_registry_artifacts(paths)
     print(f"Pruned {removed} declaration(s).")
 
 
 def audit_registry(args: argparse.Namespace, paths) -> None:
-    run_command(paths, ["lake", "build", paths.build_target], f"构建 `{paths.build_target}`")
+    build_registry(paths)
     shards = load_current_shards(paths)
     index = index_entries(shards)
     selected_names = args.decl or sorted(index.keys())
@@ -158,6 +163,7 @@ def audit_registry(args: argparse.Namespace, paths) -> None:
         if decl_name not in index:
             fail_missing_registry_decl(decl_name, action="audit")
         entries.append(copy.deepcopy(index[decl_name][1]))
+    # 按模块批量 probe，避免为每个声明单独起一个 Lean 进程。
     grouped: dict[str, list[str]] = defaultdict(list)
     for entry in entries:
         grouped[entry["module"]].append(entry["decl_name"])
@@ -178,6 +184,7 @@ def audit_registry(args: argparse.Namespace, paths) -> None:
         raise SystemExit(
             "approved statement registry 审计失败：\n" + "\n".join(f"- {problem}" for problem in problems)
         )
+    # 这些标记默认只提示人工复核；是否失败由 `--fail-on-status` 决定。
     flagged_entries = [
         entry for entry in entries if entry.get("status", "safe") != "safe" or entry.get("commit", [])
     ]
@@ -222,6 +229,7 @@ def report_registry(args: argparse.Namespace, paths) -> None:
             continue
         if status_filter and entry["status"] not in status_filter:
             continue
+        # 默认 report 面向审核者，只显示带 comment 的条目；`--all` 才看全量快照。
         if not args.all and not args.decl and not status_filter and not entry.get("commit", []):
             continue
         selected.append((key, copy.deepcopy(entry)))
@@ -277,8 +285,7 @@ def print_history(args: argparse.Namespace, paths) -> None:
 
 
 def regenerate_registry(args: argparse.Namespace, paths) -> None:
-    generate_lean_registry(paths)
-    build_registry(paths)
+    rebuild_registry_artifacts(paths)
     print("Regenerated Lean approved statement registry artifacts.")
 
 
@@ -356,6 +363,7 @@ def main(*, project_root: Path | None = None) -> None:
         ensure_unique_values(args.decl, flag="--decl")
     if hasattr(args, "module") and isinstance(args.module, list):
         ensure_unique_values(args.module, flag="--module")
+    # 入口脚本会显式传 root；直接模块执行时退回到仓库布局推导。
     root = project_root if project_root is not None else Path(__file__).resolve().parents[2]
     paths = make_paths(root.resolve())
     if args.command == "approve":

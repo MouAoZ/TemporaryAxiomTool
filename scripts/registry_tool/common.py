@@ -13,6 +13,7 @@ TOOL_NAMESPACE = "TemporaryAxiomTool"
 TOOL_REGISTRY_MODULE = f"{TOOL_NAMESPACE}.ApprovedStatementRegistry"
 TOOL_REGISTRY_TYPES_MODULE = f"{TOOL_REGISTRY_MODULE}.Types"
 TOOL_SHARDS_MODULE = f"{TOOL_REGISTRY_MODULE}.Shards"
+# `--fail-on-status` 依赖这里的严重度顺序做阈值比较。
 STATUS_ORDER = {
     "safe": 0,
     "needs_attention": 1,
@@ -59,6 +60,7 @@ def lean_shard_module(chapter: int, section: int) -> str:
 
 
 def make_paths(project_root: Path) -> RegistryPaths:
+    # 路径推导集中在这里，避免 CLI、生成器和审计逻辑各自拼路径后漂移。
     data_root = project_root / "approved_statement_registry_db"
     lean_root = project_root / TOOL_NAMESPACE / "ApprovedStatementRegistry"
     return RegistryPaths(
@@ -104,5 +106,6 @@ def status_meets_threshold(actual: str, threshold: str) -> bool:
 
 
 def sanitize_decl_token(decl_name: str) -> str:
+    # history 文件名保留可读性，同时去掉路径与文件系统敏感字符。
     token = DECL_TOKEN_RE.sub("_", decl_name).strip("_")
     return token or "decl"

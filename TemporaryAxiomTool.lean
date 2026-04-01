@@ -1,8 +1,10 @@
+module
+
 /-
 `TemporaryAxiomTool` 的库根模块。
 
-部署到其他项目时，通常只需要在宿主项目里额外 `import TemporaryAxiomTool.TemporaryAxiom`；
-这里保留一个根模块，便于单独构建和浏览工具整体结构。
+宿主项目通常直接 `import TemporaryAxiomTool.TemporaryAxiom`；这里保留根模块，
+方便单独构建工具本体，也方便浏览整体导出面。
 -/
-import TemporaryAxiomTool.ApprovedStatementRegistry
-import TemporaryAxiomTool.TemporaryAxiom
+public import TemporaryAxiomTool.ApprovedStatementRegistry
+public import TemporaryAxiomTool.TemporaryAxiom

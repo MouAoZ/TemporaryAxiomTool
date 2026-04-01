@@ -1,5 +1,12 @@
 # TemporaryAxiomTool 技术规格与工作流说明
 
+相关文档：
+
+- 快速接入与最小使用方式见 [../README.md](../README.md)
+- 数据库 schema 与字段语义见 [../approved_statement_registry_db/README.md](../approved_statement_registry_db/README.md)
+- 当前版本的结构变化与外部引用变化见 [update_record.md](./update_record.md)
+- 下游升级步骤与测试清单见 [downstream_upgrade_note.md](./downstream_upgrade_note.md)
+
 ## 目标
 
 `TemporaryAxiomTool` 用于并行形式化中的“定理陈述先批准，证明后补齐”工作流。
@@ -32,15 +39,21 @@
 
 1. Lean 侧临时公理工具:
    [../TemporaryAxiomTool/TemporaryAxiom.lean](../TemporaryAxiomTool/TemporaryAxiom.lean)
-2. Lean 侧批准注册表:
+2. Lean 侧临时公理 runtime 模块:
+   [../TemporaryAxiomTool/TemporaryAxiom/Runtime.lean](../TemporaryAxiomTool/TemporaryAxiom/Runtime.lean)
+3. Lean 侧批准注册表:
    [../TemporaryAxiomTool/ApprovedStatementRegistry.lean](../TemporaryAxiomTool/ApprovedStatementRegistry.lean)
-3. 外部注册库数据库:
+4. Lean 侧 statement hash 模块:
+   [../TemporaryAxiomTool/ApprovedStatementRegistry/Hash.lean](../TemporaryAxiomTool/ApprovedStatementRegistry/Hash.lean)
+5. 外部注册库数据库:
    [../approved_statement_registry_db/README.md](../approved_statement_registry_db/README.md)
 
 职责划分：
 
 - `TemporaryAxiom` 负责 theorem -> axiom 改写、属性校验和最终审计命令
-- `ApprovedStatementRegistry` 负责 statement hash、离线 probe 命令和运行时查找表装配
+- `TemporaryAxiom.Runtime` 负责 `temporary_axiom` 的 meta extension 与环境查询
+- `ApprovedStatementRegistry` 负责离线 probe 命令和运行时查找表装配
+- `ApprovedStatementRegistry.Hash` 负责 statement hash 计算
 - 外部数据库负责 current 快照、人工审核元数据与 statement 版本历史
 
 ## 仓库依赖
@@ -52,6 +65,23 @@
 当前实现没有额外依赖 `mathlib4`、`checkdecls` 或 `repl`。
 
 如果宿主项目本身依赖这些包，应由宿主项目自己的 `lakefile.toml` 负责声明；工具不会替宿主项目引入它们。
+
+## Lean 侧 ordinary/meta 分层
+
+当前 Lean 实现已经按 module system 友好的方式拆分：
+
+- ordinary 模块
+  - [../TemporaryAxiomTool/ApprovedStatementRegistry/Hash.lean](../TemporaryAxiomTool/ApprovedStatementRegistry/Hash.lean)
+- metaprogramming 入口模块
+  - [../TemporaryAxiomTool/TemporaryAxiom/Runtime.lean](../TemporaryAxiomTool/TemporaryAxiom/Runtime.lean)
+  - [../TemporaryAxiomTool/ApprovedStatementRegistry.lean](../TemporaryAxiomTool/ApprovedStatementRegistry.lean)
+  - [../TemporaryAxiomTool/TemporaryAxiom.lean](../TemporaryAxiomTool/TemporaryAxiom.lean)
+
+拆分原则：
+
+- `elab`、`macro_rules`、attribute 注册与 `temporary_axiom` extension 放进 compile-time 模块
+- statement hash 与 registry 类型等 ordinary helper 放进独立 ordinary 模块
+- 生成出来的 Lean shard/aggregate 文件也使用 `module` 头，避免宿主项目切换 module system 后出现 phase 或可见性问题
 
 ## Lean 侧语义规格
 
@@ -68,8 +98,8 @@ theorem YourProject.someTheorem (h : P ∧ Q) : Q ∧ P := by
 处理顺序如下：
 
 1. parser 读入完整 `declaration`
-2. command macro 发现该 theorem 带有 `@[temporary_axiom]`
-3. macro 丢弃证明体，仅保留声明头，并将 `theorem` 改写为 `axiom`
+2. `declaration` kind 上的 `macro_rules` 检测该 theorem 是否带有 `@[temporary_axiom]`
+3. 宏丢弃证明体，仅保留声明头，并将 `theorem` 改写为 `axiom`
 4. Lean 对改写后的声明正常 elaboration
 5. attribute 在 `afterTypeChecking` 阶段运行
 6. 工具读取当前环境中已经导入的批准注册表，检查：
@@ -81,6 +111,7 @@ theorem YourProject.someTheorem (h : P ∧ Q) : Q ∧ P := by
 - 下游模块看到的是一个真正进入环境的 `axiom`
 - 非法标签会在声明处立即报错，而不是等到下游使用时才失败
 - 运行时只认批准 registry，不认外部 JSON 原始文件
+- `temporary_axiom` 保留显式 attribute syntax，并在 import 阶段完成 attribute 注册
 
 ### Lean 运行时实际依赖哪些数据
 
@@ -90,6 +121,8 @@ Lean 编译时不会直接读取外部 JSON 数据库。
 
 - [../TemporaryAxiomTool/ApprovedStatementRegistry/Generated.lean](../TemporaryAxiomTool/ApprovedStatementRegistry/Generated.lean)
 - `TemporaryAxiomTool/ApprovedStatementRegistry/Shards/` 下的自动生成分片
+
+这些生成文件当前都使用 `module` 头，并由脚本输出 `public import` / `public def` 形式的共享声明。
 
 当前实现中，Lean 运行时真正依赖的批准条目字段只有：
 
@@ -178,6 +211,11 @@ import TemporaryAxiomTool.TemporaryAxiom
 - 报表和 history 只提供文本输出
 - `approve`、`prune`、`generate` 会自动重建 Lean 侧 registry 目标
 - 临时审计文件始终自动删除
+
+补充说明：
+
+- `approve` / `audit` 使用的临时 probe 文件现在会在项目根目录下生成合法模块文件名
+- `audit-temporary-axioms` 生成的临时审计文件也带 `module` 头
 
 ## 命令行为规格
 

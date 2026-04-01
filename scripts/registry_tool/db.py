@@ -40,6 +40,7 @@ def normalize_commit_field(entry: dict[str, Any]) -> list[dict[str, str]]:
 
 
 def normalize_entry(entry: dict[str, Any]) -> dict[str, Any]:
+    # 所有读路径都先走这里，手工改坏的 JSON 会在一个地方尽早暴露。
     commit_items = normalize_commit_field(entry)
     normalized = {
         "decl_name": entry["decl_name"],
@@ -118,6 +119,7 @@ def save_current_shards(paths, shards: dict[tuple[int, int], dict[str, Any]]) ->
             )
         elif path.exists():
             path.unlink()
+    # `current/` 是唯一真相来源，磁盘上不允许残留已失效 shard。
     for path in paths.current_dir.glob("*.json"):
         if path not in wanted_files:
             path.unlink()
@@ -129,6 +131,7 @@ def index_entries(shards: dict[tuple[int, int], dict[str, Any]]) -> dict[str, tu
         for entry in payload["entries"]:
             decl_name = entry["decl_name"]
             if decl_name in index:
+                # 重复声明会让生成 Lean registry 的运行时语义变得不明确。
                 raise SystemExit(
                     f"注册库中发现重复声明 `{decl_name}`，请先修复 current shard 后再继续。"
                 )
@@ -192,6 +195,7 @@ def normalize_history_record(payload: dict[str, Any]) -> dict[str, Any]:
 
 
 def history_filename(timestamp: str, decl_name: str) -> str:
+    # 带时间戳和声明名，方便人工 grep；声明名部分仍需做文件名清洗。
     compact = timestamp.replace("-", "").replace(":", "")
     return f"statement_history.{compact}.{sanitize_decl_token(decl_name)}.json"
 
@@ -225,6 +229,7 @@ def load_history_records(paths) -> list[dict[str, Any]]:
     records: list[dict[str, Any]] = []
     for path in sorted(paths.history_dir.glob("*.json"), reverse=True):
         records.append(normalize_history_record(read_json(path)))
+    # 文件系统顺序不可靠，统一二次排序保证 history 输出稳定。
     records.sort(key=lambda item: (item["timestamp"], item["decl_name"]), reverse=True)
     return records
 
@@ -252,6 +257,7 @@ def update_entry_commit(
     clear: bool,
     drop: int | None,
 ) -> None:
+    # commit/status 是纯人工元数据；只有 hash 变化时才由 approve 写 history。
     commit_items = copy.deepcopy(entry.get("commit", []))
     if clear:
         commit_items = []
