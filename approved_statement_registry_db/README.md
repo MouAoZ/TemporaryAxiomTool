@@ -3,8 +3,10 @@
 相关文档：
 
 - 工具行为、命令参数与工作流见 [../docs/temporary_axiom.md](../docs/temporary_axiom.md)
-- 版本变化与外部引用变化见 [../docs/update_record.md](../docs/update_record.md)
+- 版本变化与 breaking changes 见 [../CHANGELOG.md](../CHANGELOG.md)
 - 下游升级步骤与测试清单见 [../docs/downstream_upgrade_note.md](../docs/downstream_upgrade_note.md)
+
+这份文档只定义数据库目录结构、JSON 字段语义和 history 规则；命令工作流不在这里重复展开。
 
 ## 作用范围
 
@@ -99,6 +101,7 @@ Lean 运行时真正消费的只是每条批准记录中的：
 约束：
 
 - `shard_id` 必须与 `chapter`、`section` 一致
+- 正常使用时 `shard_id` 由脚本根据 `chapter`、`section` 自动生成，不需要手工指定
 - `entries` 为空时，该 shard 文件通常会被脚本删除
 - 通过脚本写入时，`entries` 会按 `decl_name` 排序
 

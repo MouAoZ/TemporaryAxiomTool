@@ -6,9 +6,27 @@
 
 相关文档：
 
-- 版本变化与外部引用变化见 [update_record.md](./update_record.md)
+- 版本变化与 breaking changes 见 [../CHANGELOG.md](../CHANGELOG.md)
 - 完整技术规格、工具行为与命令参数说明见 [temporary_axiom.md](./temporary_axiom.md)
 - 数据库 schema 与字段语义见 [../approved_statement_registry_db/README.md](../approved_statement_registry_db/README.md)
+
+## 开始前先确认
+
+这几条是升级阻断条件；如果不满足，不要继续执行后面的升级命令。
+
+- 如果宿主项目自己的 Lean 文件仍是旧式非 `module` 文件，先迁移宿主项目，再升级本工具
+- 当前版本的 `approve`、`audit`、`audit-temporary-axioms` 会临时生成 `module` 文件；它们无法 import 旧式非 `module` 业务模块
+- 这类情况下常见的直接报错是：
+
+```text
+cannot import non-`module` ... from `module`
+```
+
+如果宿主项目正从旧式显式 namespace 文件迁移到 `module` 文件，还要额外先检查三件事：
+
+- 跨模块仍要保持可见的声明，是否需要同步调整导出方式，例如改成 `public def` / `public theorem`
+- 声明全名是否因为 `namespace` / `module` 重排而漂移
+- 一旦 `decl_name` 变化，对应 registry 条目就需要重新 `approve`
 
 ## 本次升级的影响范围
 
@@ -21,7 +39,7 @@
   - `scripts/manage_approved_statement_registry.py`
   - `scripts/registry_tool/`
 - 说明文档
-  - `docs/update_record.md`
+  - `CHANGELOG.md`
   - `docs/temporary_axiom.md`
   - `approved_statement_registry_db/README.md`
 - CI 命令
@@ -51,6 +69,13 @@
 
 如果数据库仍在使用更早期的字段名或条目结构，请先按 [../approved_statement_registry_db/README.md](../approved_statement_registry_db/README.md) 的当前格式整理，再运行下面的生成与审计命令。当前版本不提供旧 schema 的专门兼容层。
 
+如果宿主项目正在从旧式显式 namespace 文件迁移到 `module` 文件，还应提前准备核对：
+
+- `decl_name` 是否发生漂移
+- 跨模块使用的声明是否需要调整为 `public def` / `public theorem`
+- `--module` 参数是否仍指向正确模块
+- registry 旧条目是否需要重新 `approve`
+
 ## 推荐升级步骤
 
 ### 1. 整包同步工具代码
@@ -62,7 +87,7 @@
 - `scripts/manage_approved_statement_registry.py`
 - `scripts/registry_tool/`
 - `docs/temporary_axiom.md`
-- `docs/update_record.md`
+- `CHANGELOG.md`
 - `approved_statement_registry_db/README.md`
 
 如果你的宿主项目把工具作为 vendored code 直接放在仓库根目录，这一步通常就是直接覆盖这些工具代码与文档文件，但保留你自己的 `approved_statement_registry_db/current/` 和 `history/` 数据。
@@ -93,6 +118,8 @@
       --module YourProject
 ```
 
+如果宿主项目不是单一根模块，而是需要从多个入口模块展开审计，这里应重复传入多个 `--module`，不要假设一个 `YourProject` 就能覆盖全部导入链。
+
 ### 3. 重新生成 Lean 侧 registry 文件
 
 同步完成后，先不要直接信任旧的生成物。先运行：
@@ -109,6 +136,8 @@ lake build
 ```
 
 第一条命令确认工具本身与 generated registry 可以单独通过；第二条命令确认宿主项目整体导入链没有被这次升级打断。
+
+如果这一步失败，并出现“cannot import non-`module` ... from `module`”之类错误，不要继续调工具脚本；先完成宿主项目的 module-system 迁移。
 
 ### 5. 重新跑 registry 审计
 
@@ -269,6 +298,18 @@ python3 scripts/manage_approved_statement_registry.py report \
 ### 症状 1
 
 ```text
+cannot import non-`module` ... from `module`
+```
+
+优先排查：
+
+- 宿主项目业务 Lean 文件是否仍是旧式非 `module` 文件
+- 是否在宿主项目还没完成 module-system 迁移前，就先运行了 `approve`、`audit` 或 `audit-temporary-axioms`
+- 如果宿主项目刚迁移为 `module` 文件，是否还残留旧的显式 namespace 布局，导致 `decl_name` 或导出方式已经变化
+
+### 症状 2
+
+```text
 Invalid definition `...initFn✝`, may not access declaration `...` marked as `meta`
 ```
 
@@ -278,7 +319,7 @@ Invalid definition `...initFn✝`, may not access declaration `...` marked as `m
 - 是否宿主项目中还残留旧版生成文件
 - 是否忘了在同步后重新运行 `generate`
 
-### 症状 2
+### 症状 3
 
 ```text
 ./scripts/run_approved_statement_registry_audit.sh: No such file or directory
@@ -289,7 +330,7 @@ Invalid definition `...initFn✝`, may not access declaration `...` marked as `m
 - CI 是否还在调用旧 shell 脚本
 - 是否已经改成 `python3 scripts/manage_approved_statement_registry.py audit`
 
-### 症状 3
+### 症状 4
 
 ```text
 `--module` 不允许重复值：e, t, r, ...
@@ -299,7 +340,7 @@ Invalid definition `...initFn✝`, may not access declaration `...` marked as `m
 
 - 下游项目是否只更新了入口脚本，但没同步最新的 `scripts/registry_tool/cli.py`
 
-### 症状 4
+### 症状 5
 
 ```text
 approved statement registry 审计失败：

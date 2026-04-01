@@ -16,11 +16,17 @@
 - [docs/temporary_axiom.md](docs/temporary_axiom.md): 完整技术规格、工具行为说明、命令参数说明与示例
 - [approved_statement_registry_db/README.md](approved_statement_registry_db/README.md): 注册库数据库格式、字段语义与 history 规则
 - [docs/downstream_upgrade_note.md](docs/downstream_upgrade_note.md): 下游项目从旧版本升级时的迁移步骤与测试清单
-- [docs/update_record.md](docs/update_record.md): 当前版本的结构变化、外部引用变化与回归验证摘要
+- [CHANGELOG.md](CHANGELOG.md): 版本变化、breaking changes 与外部引用变化
+
+README 只保留快速接入、最小工作流和仓库结构；命令细节、数据库 schema 与升级回归要求分别放在上面的专门文档里。
 
 ## 环境要求
 
+- 当前版本: `0.1.0`
 - Lean `v4.29.0-rc8`
+- 宿主项目已采用 Lean module system
+  - 业务 Lean 文件应使用 `module` 头
+  - 当前版本不支持旧式非 `module` downstream
 
 工具本体当前不依赖额外的 Lake 包；依赖声明见 [lakefile.toml](lakefile.toml) 与 [lean-toolchain](lean-toolchain)。
 
@@ -48,6 +54,9 @@ name = "TemporaryAxiomTool"
 ```bash
 lake build TemporaryAxiomTool
 ```
+
+如果宿主项目仍是旧式非 `module` 文件布局，先不要直接接入当前版本。
+当前脚本生成的 probe / 临时审计文件本身就是 `module` 文件，因此它们只能 import 同样采用 module system 的宿主模块。
 
 如果你是在已有宿主项目里同步更新本工具，而不是初次接入，建议额外执行：
 
@@ -134,7 +143,7 @@ python3 scripts/manage_approved_statement_registry.py audit-temporary-axioms \
 - [approved_statement_registry_db/](approved_statement_registry_db/): 外部注册库数据库
 - [scripts/manage_approved_statement_registry.py](scripts/manage_approved_statement_registry.py): 唯一 CLI 入口
 
-当前 Lean 侧实现已经整理为兼容 Lean 4 module system 的结构；变更摘要见 [docs/update_record.md](docs/update_record.md)。
+当前 Lean 侧实现已经整理为兼容 Lean 4 module system 的结构；变更摘要见 [CHANGELOG.md](CHANGELOG.md)。
 
 ## 当前仓库状态
 

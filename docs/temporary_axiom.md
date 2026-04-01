@@ -4,7 +4,7 @@
 
 - 快速接入与最小使用方式见 [../README.md](../README.md)
 - 数据库 schema 与字段语义见 [../approved_statement_registry_db/README.md](../approved_statement_registry_db/README.md)
-- 当前版本的结构变化与外部引用变化见 [update_record.md](./update_record.md)
+- 当前版本的结构变化与 breaking changes 见 [../CHANGELOG.md](../CHANGELOG.md)
 - 下游升级步骤与测试清单见 [downstream_upgrade_note.md](./downstream_upgrade_note.md)
 
 ## 目标
@@ -35,7 +35,7 @@
 
 ## 总体架构
 
-工具由三层组成：
+工具由五个部分组成：
 
 1. Lean 侧临时公理工具:
    [../TemporaryAxiomTool/TemporaryAxiom.lean](../TemporaryAxiomTool/TemporaryAxiom.lean)
@@ -63,6 +63,11 @@
 - `leanprover/lean4:v4.29.0-rc8`
 
 当前实现没有额外依赖 `mathlib4`、`checkdecls` 或 `repl`。
+
+对宿主项目还有一个额外前提：
+
+- 当前版本要求宿主项目已经采用 Lean module system
+- 旧式非 `module` 业务模块不在当前支持范围内
 
 如果宿主项目本身依赖这些包，应由宿主项目自己的 `lakefile.toml` 负责声明；工具不会替宿主项目引入它们。
 
@@ -124,6 +129,8 @@ Lean 编译时不会直接读取外部 JSON 数据库。
 
 这些生成文件当前都使用 `module` 头，并由脚本输出 `public import` / `public def` 形式的共享声明。
 
+同样地，`approve`、`audit`、`audit-temporary-axioms` 在执行时生成的临时 probe / 审计文件也使用 `module` 头，因此它们要求宿主业务模块本身也是 module-system 文件。
+
 当前实现中，Lean 运行时真正依赖的批准条目字段只有：
 
 - `decl_name`
@@ -160,6 +167,8 @@ Lean 编译时不会直接读取外部 JSON 数据库。
 - 不要猜测“这算不算小改动”
 - 只要 theorem header 的语义可能变了，就重新运行 `approve`
 
+如果宿主项目是在从旧式显式 namespace 文件迁移到 `module` 文件，除了 statement hash 之外，还要额外核对声明全名是否漂移；一旦 `decl_name` 变化，旧 registry 条目也需要重新校正。
+
 ## import 规则
 
 宿主项目普通文件不需要额外 import。
@@ -178,18 +187,18 @@ import TemporaryAxiomTool.TemporaryAxiom
 
 ## 当前对象模型
 
-对单个 declaration 而言，可以把它理解为下面几层状态：
+对单个 declaration 而言，当前工具只关心三件事：
 
-1. 是否已批准
-   - 未批准: 不在 current 快照中，不能使用 `@[temporary_axiom]`
-   - 已批准: 在 current 快照中，可以被 registry 校验
-2. 当前审核状态
-   - `safe`
-   - `needs_attention`
-   - `unreliable`
-3. 当前人工评论
-   - `commit = []`
-   - `commit = [ ... ]`
+- 是否已批准
+  - 未批准: 不在 current 快照中，不能使用 `@[temporary_axiom]`
+  - 已批准: 在 current 快照中，可以被 registry 校验
+- 当前审核状态
+  - `safe`
+  - `needs_attention`
+  - `unreliable`
+- 当前人工评论
+  - `commit = []`
+  - `commit = [ ... ]`
 
 注意：
 
@@ -210,14 +219,17 @@ import TemporaryAxiomTool.TemporaryAxiom
 
 - 报表和 history 只提供文本输出
 - `approve`、`prune`、`generate` 会自动重建 Lean 侧 registry 目标
-- 临时审计文件始终自动删除
-
-补充说明：
-
-- `approve` / `audit` 使用的临时 probe 文件现在会在项目根目录下生成合法模块文件名
+- 临时 probe / 审计文件始终自动删除
+- `approve` / `audit` 使用的临时 probe 文件会在项目根目录下生成合法模块文件名
 - `audit-temporary-axioms` 生成的临时审计文件也带 `module` 头
 
 ## 命令行为规格
+
+### 通用 CLI 约定
+
+- 文中的 `decl_name` / `--decl` 都指 Lean 全限定声明名
+- 文中的 `module` / `--module` 都指 Lean import 路径，不是文件系统路径
+- 支持重复传入的列表参数都不接受重复值
 
 ### `approve`
 
@@ -238,28 +250,12 @@ import TemporaryAxiomTool.TemporaryAxiom
 
 参数说明：
 
-- `--module`
-  - 含义: 用于探测声明的 Lean 模块名
-  - 取值: Lean import 路径字符串，例如 `YourProject.Section2`
-  - 约束: 单次命令只接受一个模块；该模块必须能导入本次所有 `--decl`
-- `--chapter`
-  - 含义: 注册库分片所属 chapter 编号
-  - 取值: 十进制整数
-- `--section`
-  - 含义: 注册库分片所属 section 编号
-  - 取值: 十进制整数
-- `--decl`
-  - 含义: 要批准的定理名
-  - 取值: Lean 全限定声明名字符串，例如 `YourProject.someTheorem`
-  - 约束: 支持重复传入多个不同声明；不允许重复传入同一个值
-- `--reason`
-  - 含义: 审批原因
-  - 取值: 简短字符串
-  - 默认值: `approved statement freeze`
-- `--author`
-  - 含义: 最近一次批准的操作者
-  - 取值: 字符串
-  - 默认值: `ai-agent`
+- `--module`: 用于探测声明的 Lean 模块；取值为 Lean import 路径；单次命令只接受一个模块，且该模块必须能导入本次所有 `--decl`
+- `--chapter`: 注册库分片所属 chapter 编号；十进制整数
+- `--section`: 注册库分片所属 section 编号；十进制整数
+- `--decl`: 要批准的定理名；支持重复传入多个不同声明
+- `--reason`: 审批原因；默认 `approved statement freeze`
+- `--author`: 最近一次批准的操作者；默认 `ai-agent`
 
 示例：
 
@@ -297,31 +293,13 @@ python3 scripts/manage_approved_statement_registry.py approve \
 
 参数说明：
 
-- `--decl`
-  - 含义: 已批准定理名
-  - 取值: Lean 全限定声明名字符串
-  - 约束: 支持重复传入多个不同声明；不允许重复传入同一个值
-- `--status`
-  - 含义: 显式设置审核状态
-  - 取值: `safe`、`needs_attention`、`unreliable`
-- `--message`
-  - 含义: 要写入的人工评论
-  - 取值: 字符串
-  - 说明: 默认会覆盖该条目的整个 `commit` 列表
-- `--append`
-  - 含义: 追加一条 `commit`，而不是覆盖
-  - 类型: 布尔开关
-  - 约束: 必须和 `--message` 一起使用
-- `--clear`
-  - 含义: 清空该条目的全部 `commit`
-  - 类型: 布尔开关
-- `--drop`
-  - 含义: 删除该条目中指定序号的 `commit`
-  - 取值: 1-based 正整数
-- `--author`
-  - 含义: 写入 `commit` 元数据的操作者
-  - 取值: 字符串
-  - 默认值: `ai-agent`
+- `--decl`: 已批准定理名；支持重复传入多个不同声明
+- `--status`: 显式设置审核状态；取值为 `safe`、`needs_attention`、`unreliable`
+- `--message`: 要写入的人工评论；默认覆盖该条目的整个 `commit` 列表
+- `--append`: 追加一条 `commit` 而不是覆盖；必须和 `--message` 一起使用
+- `--clear`: 清空该条目的全部 `commit`
+- `--drop`: 删除指定序号的 `commit`；取值为 1-based 正整数
+- `--author`: 写入 `commit` 元数据的操作者；默认 `ai-agent`
 
 常见用法：
 
@@ -380,23 +358,11 @@ python3 scripts/manage_approved_statement_registry.py commit \
 
 参数说明：
 
-- `--decl`
-  - 含义: 精确声明名过滤
-  - 取值: Lean 全限定声明名字符串
-  - 约束: 支持重复传入多个不同声明；不允许重复传入同一个值
-- `--status`
-  - 含义: 状态过滤
-  - 取值: `safe`、`needs_attention`、`unreliable`
-  - 约束: 支持重复传入
-- `--all`
-  - 含义: 打印全部 current 条目，而不是默认的“仅有 commit 的条目”
-  - 类型: 布尔开关
-- `--verbose`
-  - 含义: 追加打印 `module`、`shard`、`approval_reason`
-  - 类型: 布尔开关
-- `--lifecycle`
-  - 含义: 再追加打印生命周期元数据
-  - 类型: 布尔开关
+- `--decl`: 精确声明名过滤；支持重复传入多个不同声明
+- `--status`: 状态过滤；取值为 `safe`、`needs_attention`、`unreliable`，支持重复传入
+- `--all`: 打印全部 current 条目，而不是默认的“仅有 commit 的条目”
+- `--verbose`: 追加打印 `module`、`shard`、`approval_reason`
+- `--lifecycle`: 再追加打印生命周期元数据
 
 示例：
 
@@ -421,14 +387,8 @@ python3 scripts/manage_approved_statement_registry.py report \
 
 参数说明：
 
-- `--decl`
-  - 含义: 审计范围过滤
-  - 取值: Lean 全限定声明名字符串
-  - 约束: 支持重复传入多个不同声明；省略时审计 current 中全部声明
-- `--fail-on-status`
-  - 含义: 审核状态阈值
-  - 取值: `needs_attention`、`unreliable`
-  - 作用: 若任一被选中条目的 `status` 达到或超过该级别，则命令失败
+- `--decl`: 审计范围过滤；支持重复传入多个不同声明；省略时审计 current 中全部声明
+- `--fail-on-status`: 审核状态阈值；取值为 `needs_attention`、`unreliable`；若任一被选中条目的 `status` 达到或超过该级别则命令失败
 
 示例：
 
@@ -452,10 +412,7 @@ python3 scripts/manage_approved_statement_registry.py audit --fail-on-status nee
 
 参数说明：
 
-- `--module`
-  - 含义: 导入到临时审计入口中的 Lean 模块
-  - 取值: Lean import 路径字符串
-  - 约束: 支持重复传入多个不同模块；至少需要提供一个；不允许重复值
+- `--module`: 导入到临时审计入口中的 Lean 模块；至少需要提供一个，支持重复传入多个不同模块
 
 示例：
 
@@ -473,10 +430,7 @@ python3 scripts/manage_approved_statement_registry.py audit-temporary-axioms \
 
 参数说明：
 
-- `--decl`
-  - 含义: 要移除的定理名
-  - 取值: Lean 全限定声明名字符串
-  - 约束: 支持重复传入多个不同声明；不允许重复传入同一个值
+- `--decl`: 要移除的定理名；支持重复传入多个不同声明
 
 示例：
 
@@ -498,16 +452,9 @@ python3 scripts/manage_approved_statement_registry.py prune \
 
 参数说明：
 
-- `--decl`
-  - 含义: 声明名过滤
-  - 取值: Lean 全限定声明名字符串
-  - 约束: 支持重复传入多个不同声明；不允许重复传入同一个值
-- `--limit`
-  - 含义: 输出条数上限
-  - 取值: 十进制整数
-- `--verbose`
-  - 含义: 打印 shard 与 before/after statement
-  - 类型: 布尔开关
+- `--decl`: 声明名过滤；支持重复传入多个不同声明
+- `--limit`: 输出条数上限；十进制整数
+- `--verbose`: 打印 shard 与 before/after statement
 
 示例：
 
