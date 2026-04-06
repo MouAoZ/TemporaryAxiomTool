@@ -2,7 +2,7 @@ module
 
 public import Lean
 
-namespace TemporaryAxiomTool.ApprovedStatementRegistry
+namespace TemporaryAxiomTool
 
 open Lean
 
@@ -65,11 +65,7 @@ private partial def hashExprCore (levelParamIndex : NameMap Nat) : Expr → UInt
   | .proj structName idx body =>
       mixHash (hash 20) <| mixHash (hash structName) <| mixHash (hash idx) (hashExprCore levelParamIndex body)
 
-/--
-对声明的 elaborated type 做稳定哈希。
-
-这份 hash 是批准注册库与 `@[temporary_axiom]` 校验共用的唯一标准。
--/
+/-- 对声明的 elaborated type 做稳定哈希。 -/
 public def statementHash (levelParams : List Name) (type : Expr) : UInt64 :=
   hashExprCore (mkLevelParamIndex levelParams) type
 
@@ -77,4 +73,4 @@ public def statementHash (levelParams : List Name) (type : Expr) : UInt64 :=
 public def statementHashOfConstInfo (constInfo : ConstantInfo) : UInt64 :=
   statementHash constInfo.levelParams constInfo.type
 
-end TemporaryAxiomTool.ApprovedStatementRegistry
+end TemporaryAxiomTool

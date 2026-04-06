@@ -12,7 +12,12 @@ jobs:
     steps:
       - uses: actions/checkout@v5
       - uses: leanprover/lean-action@v1
-      # approved-statement-registry-audit:start
-      - name: Approved statement registry audit
-        run: python3 scripts/manage_approved_statement_registry.py audit
-      # approved-statement-registry-audit:end
+      - name: Check Python CLI
+        run: python3 -m py_compile scripts/temporary_axiom_session.py scripts/session_tool/*.py
+      - name: Session Roundtrip
+        run: |
+          python3 scripts/temporary_axiom_session.py prepare \
+            --target TemporaryAxiomTool.TestFixture.Target.goal
+          lake build TemporaryAxiomTool.TestFixture.Target
+          python3 scripts/temporary_axiom_session.py cleanup
+          lake build TemporaryAxiomTool.TestFixture.Target

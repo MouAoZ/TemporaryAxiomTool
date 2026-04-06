@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 from pathlib import Path
 
-from registry_tool.cli import main
+from session_tool.cli import main
 
 
 if __name__ == "__main__":

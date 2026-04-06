@@ -1,154 +1,125 @@
 # TemporaryAxiomTool
 
-`TemporaryAxiomTool` 是一个面向 Lean 4 并行形式化的工具库，用来管理“先冻结 theorem statement，后补证明”的工作流。
+`TemporaryAxiomTool` 是一个轻量的 Lean 4 session 准备器，用于单次证明 attempt。
 
-它的核心约束是：
+仓库里的文档分工如下：
 
-- 只有已经进入批准注册库的陈述，才允许被标记为 `@[temporary_axiom]`
-- Lean 会在声明通过 elaboration 后立即校验 statement hash，防止陈述漂移
-- 人工审核元数据与 statement 版本历史分离管理
-- 项目收尾时必须通过审计确认临时公理全部移除
+- `README.md`
+  入口文档，只保留快速使用和文档导航。
+- `docs/temporary_axiom.md`
+  技术规格，说明产物、流程和运行时检查。
+- `docs/downstream_upgrade_note.md`
+  迁移说明，面向从旧版 registry 工作流切到当前 session 工作流的维护者。
 
-这个仓库提供的是可复用工具本体，而不是某个具体形式化项目的示例工程。
+## 快速使用
 
-## 文档导航
-
-- [docs/temporary_axiom.md](docs/temporary_axiom.md): 完整技术规格、工具行为说明、命令参数说明与示例
-- [approved_statement_registry_db/README.md](approved_statement_registry_db/README.md): 注册库数据库格式、字段语义与 history 规则
-- [docs/downstream_upgrade_note.md](docs/downstream_upgrade_note.md): 下游项目从旧版本升级时的迁移步骤与测试清单
-- [CHANGELOG.md](CHANGELOG.md): 版本变化、breaking changes 与外部引用变化
-
-README 只保留快速接入、最小工作流和仓库结构；命令细节、数据库 schema 与升级回归要求分别放在上面的专门文档里。
-
-## 环境要求
-
-- 当前版本: `0.1.0`
-- Lean `v4.29.0-rc8`
-- 宿主项目已采用 Lean module system
-  - 业务 Lean 文件应使用 `module` 头
-  - 当前版本不支持旧式非 `module` downstream
-
-工具本体当前不依赖额外的 Lake 包；依赖声明见 [lakefile.toml](lakefile.toml) 与 [lean-toolchain](lean-toolchain)。
-
-如果宿主项目本身依赖 `mathlib4` 或其他包，应继续由宿主项目自行声明和管理。
-
-## 接入宿主项目
-
-当前仓库的设计偏向将工具文件直接同步到宿主 Lean 项目根目录。最小接入集合通常包括：
-
-- `TemporaryAxiomTool.lean`
-- `TemporaryAxiomTool/`
-- `approved_statement_registry_db/`
-- `scripts/manage_approved_statement_registry.py`
-- `scripts/registry_tool/`
-
-然后在宿主项目的 `lakefile.toml` 中加入：
-
-```toml
-[[lean_lib]]
-name = "TemporaryAxiomTool"
-```
-
-首次接入后建议执行：
+先构建：
 
 ```bash
 lake build TemporaryAxiomTool
 ```
 
-如果宿主项目仍是旧式非 `module` 文件布局，先不要直接接入当前版本。
-当前脚本生成的 probe / 临时审计文件本身就是 `module` 文件，因此它们只能 import 同样采用 module system 的宿主模块。
-
-如果你是在已有宿主项目里同步更新本工具，而不是初次接入，建议额外执行：
+准备一次 session：
 
 ```bash
-python3 scripts/manage_approved_statement_registry.py generate
-lake build TemporaryAxiomTool
+python3 scripts/temporary_axiom_session.py prepare \
+  --target YourProject.Section:goal
 ```
 
-完整升级步骤见 [docs/downstream_upgrade_note.md](docs/downstream_upgrade_note.md)。
-
-## 最小使用方式
-
-只有需要跳过证明的 Lean 文件才需要导入：
-
-```lean
-import TemporaryAxiomTool.TemporaryAxiom
-```
-
-将 theorem 写成：
-
-```lean
-@[temporary_axiom]
-theorem YourProject.someTheorem (h : P ∧ Q) : Q ∧ P := by
-  -- 证明体只要求能通过语法解析
-  ...
-```
-
-该声明会在语法层被改写为 `axiom`，但只有当下面两项都成立时才会通过校验：
-
-- `YourProject.someTheorem` 已经存在于已批准陈述注册库中
-- 当前 elaborated statement hash 与批准记录一致
-
-## 常用工作流
-
-1. 批准陈述：
+也可以直接传完整声明名：
 
 ```bash
-python3 scripts/manage_approved_statement_registry.py approve \
-  --module YourProject.Section2 \
-  --chapter 3 \
-  --section 2 \
-  --decl YourProject.someTheorem
+python3 scripts/temporary_axiom_session.py prepare \
+  --target YourProject.Section.goal
 ```
 
-2. 在需要时写入审核元数据：
+结束后清理：
 
 ```bash
-python3 scripts/manage_approved_statement_registry.py commit \
-  --decl YourProject.someTheorem \
-  --status needs_attention \
-  --message "binder order changed; manual review suggested"
+python3 scripts/temporary_axiom_session.py cleanup
 ```
 
-3. 为审核者打印当前条目：
+外层工具应读取 `.temporary_axiom_session/session.json`，再取其中的 `freeze` 字段。
 
-```bash
-python3 scripts/manage_approved_statement_registry.py report
+例如：
+
+```python
+session = json.load(open(".temporary_axiom_session/session.json"))
+freeze = session["freeze"]
 ```
 
-4. 审计 current 快照与 Lean 环境：
+## Session 是什么
 
-```bash
-python3 scripts/manage_approved_statement_registry.py audit
-```
+这里的一次 session，指的是围绕一个 target theorem，把当前 workspace 暂时准备成一次“受控证明尝试”的状态。
 
-5. 发布前审计是否还残留 `temporary_axiom`：
+`prepare` 会做三类事：
 
-```bash
-python3 scripts/manage_approved_statement_registry.py audit-temporary-axioms \
-  --module YourProject
-```
+- 冻结这次尝试要使用的信息：target theorem、module closure、允许临时公理化的声明及其 statement hash。
+- 生成 Lean 侧 runtime：把冻结结果写入 `TemporaryAxiomTool/PreparedSession/Generated.lean`。
+- 对源码做受控修改：插入 managed import，并给允许的声明加上 managed `@[temporary_axiom]`。
 
-所有子命令的完整参数说明与更多示例见 [docs/temporary_axiom.md](docs/temporary_axiom.md)。
+`prepare` 完成后，还会给用户输出一份摘要：
 
-## 仓库结构
+- 涉及模块数量
+- permitted temporary axioms 数量
+- 列表较短时，直接按模块打印哪些定理被转成临时公理
+- 列表较长时，提示去看根目录下的明文报告
 
-- [TemporaryAxiomTool.lean](TemporaryAxiomTool.lean): 库根模块
-- [TemporaryAxiomTool/TemporaryAxiom.lean](TemporaryAxiomTool/TemporaryAxiom.lean): `@[temporary_axiom]` 宏、属性与审计命令
-- [TemporaryAxiomTool/TemporaryAxiom/Runtime.lean](TemporaryAxiomTool/TemporaryAxiom/Runtime.lean): `temporary_axiom` 运行时 extension 与环境查询
-- [TemporaryAxiomTool/ApprovedStatementRegistry.lean](TemporaryAxiomTool/ApprovedStatementRegistry.lean): 注册表入口
-- [TemporaryAxiomTool/ApprovedStatementRegistry/Types.lean](TemporaryAxiomTool/ApprovedStatementRegistry/Types.lean): 运行时批准条目类型
-- [TemporaryAxiomTool/ApprovedStatementRegistry/Hash.lean](TemporaryAxiomTool/ApprovedStatementRegistry/Hash.lean): statement hash 计算逻辑
-- [TemporaryAxiomTool/ApprovedStatementRegistry/Generated.lean](TemporaryAxiomTool/ApprovedStatementRegistry/Generated.lean): 自动生成的注册表聚合模块
-- [approved_statement_registry_db/](approved_statement_registry_db/): 外部注册库数据库
-- [scripts/manage_approved_statement_registry.py](scripts/manage_approved_statement_registry.py): 唯一 CLI 入口
+同一个 workspace 内不允许并发执行两个 `prepare`；如果另一个 `prepare` 正在运行，工具会直接报错并拒绝进入中间状态。
 
-当前 Lean 侧实现已经整理为兼容 Lean 4 module system 的结构；变更摘要见 [CHANGELOG.md](CHANGELOG.md)。
+`--target` 支持两种输入：
 
-## 当前仓库状态
+- `<module>:<decl>`
+- `<fully-qualified-decl>`
 
-这是一个工具源仓库，因此默认只保留可复用骨架：
+第二种形式不会触发仓库扫描；工具只会按声明名前缀尝试有限个候选模块。若声明名与模块路径不对齐，应改用第一种形式。
 
-- `approved_statement_registry_db/current/` 与 `history/` 为空模板目录
-- [TemporaryAxiomTool/ApprovedStatementRegistry/Generated.lean](TemporaryAxiomTool/ApprovedStatementRegistry/Generated.lean) 是空聚合入口
-- 仓库中不包含任何宿主项目的 theorem 数据或业务形式化内容
+为避免陈旧 `.ilean` / `.olean` 把标签插到错误位置，`prepare` 还会做两类轻量一致性检查：
+
+- 用 `.ilean` range 切出的源码片段必须仍然对应到声明名本身。
+- 写完 runtime、`session.json` 和源码 managed 修改后，会立刻做一次本地 manifest 自检。
+
+这样做之后，proving agent 可以在 Lean 里继续工作，但只有这次 session 明确允许的 `sorry` 声明，才会被当作临时公理使用。
+
+## 为什么会改源码
+
+`@[temporary_axiom]` 的作用，不是做标记展示，而是把带标签的 `theorem` 改写成 `axiom`，并在 Lean elaboration 里立即检查它是否满足本次 session 的规则。
+
+这也是 `prepare` 需要插入 import 和 attribute 的原因：
+
+- `import TemporaryAxiomTool.TemporaryAxiom`
+  让当前模块加载 attribute 和运行时检查逻辑。
+- `@[temporary_axiom]`
+  只加在本次允许跳过证明的声明上，使这些声明在当前 attempt 里临时按公理处理。
+
+如果目标定理本身被打标签、未获许可的声明被打标签，或者声明头发生 hash drift，Lean 会在声明处直接报错。
+
+## `session.json` 里有什么
+
+`.temporary_axiom_session/session.json` 只有两个顶层部分：
+
+- `freeze`
+  给外层 verifier / comparator 读取的冻结信息。
+- `cleanup`
+  给本工具自己的 `cleanup` 命令使用的 edit log。
+
+`freeze` 的语义是：
+
+- `target`
+  这次 attempt 的目标定理，以及它冻结时的 statement hash。
+- `module_closure`
+  这次收集 permitted declarations 时考察过的项目内模块闭包。
+- `permitted_axioms`
+  这次 attempt 中允许携带 `@[temporary_axiom]` 的声明列表。每条记录都带有模块名、冻结时的 statement hash，以及来源类型。
+
+外层工具通常只需要 `freeze`；`cleanup` 只用于撤销 TemporaryAxiomTool 自己插入的 managed 修改。
+
+此外还会在仓库根目录生成：
+
+- `temporary_axiom_tool_session_report.txt`
+  给人读的明文报告，汇总 target、module closure 和按模块分组的 permitted temporary axioms。
+
+## 文档
+
+- [docs/temporary_axiom.md](docs/temporary_axiom.md)
+- [docs/downstream_upgrade_note.md](docs/downstream_upgrade_note.md)
