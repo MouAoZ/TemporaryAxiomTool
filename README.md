@@ -72,6 +72,13 @@ freeze = session["freeze"]
 - `<module>:<decl>`
 - `<fully-qualified-decl>`
 
+其中第一种里的 `<decl>` 可以是短名，也可以是 Lean 的完整声明名。
+
+- `--target Foo.Bar:goal`
+  会在定义模块 `Foo.Bar` 内按短名 `goal` 定向查找唯一匹配的声明。
+- `--target Foo.Bar:My.Namespace.goal`
+  会把 `My.Namespace.goal` 当成完整声明名处理，并要求它的定义模块正是 `Foo.Bar`。
+
 第二种形式不会触发仓库扫描；工具只会按声明名前缀尝试有限个候选模块。若声明名与模块路径不对齐，应改用第一种形式。
 
 为避免陈旧 `.ilean` / `.olean` 把标签插到错误位置，`prepare` 还会做两类轻量一致性检查：
@@ -106,11 +113,11 @@ freeze = session["freeze"]
 `freeze` 的语义是：
 
 - `target`
-  这次 attempt 的目标定理，以及它冻结时的 statement hash。
+  这次 attempt 的目标定理，以及它冻结时的 statement hash。`target.decl_name` 记录的是 Lean 的真实全限定声明名；`target.module` 记录的是定义模块名。
 - `module_closure`
   这次收集 permitted declarations 时考察过的项目内模块闭包。
 - `permitted_axioms`
-  这次 attempt 中允许携带 `@[temporary_axiom]` 的声明列表。每条记录都带有模块名、冻结时的 statement hash，以及来源类型。
+  这次 attempt 中允许携带 `@[temporary_axiom]` 的声明列表。每条记录都带有 Lean 的真实全限定声明名、定义模块名、冻结时的 statement hash，以及来源类型。
 
 外层工具通常只需要 `freeze`；`cleanup` 只用于撤销 TemporaryAxiomTool 自己插入的 managed 修改。
 

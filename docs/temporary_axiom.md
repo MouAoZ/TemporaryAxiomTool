@@ -52,6 +52,7 @@
 
 ```bash
 python3 scripts/temporary_axiom_session.py prepare --target MyProj.Mod:goal
+python3 scripts/temporary_axiom_session.py prepare --target MyProj.Mod:My.Namespace.goal
 python3 scripts/temporary_axiom_session.py prepare --target MyProj.Mod.goal
 python3 scripts/temporary_axiom_session.py cleanup
 ```
@@ -88,7 +89,7 @@ python3 scripts/temporary_axiom_session.py cleanup
   "base_commit": "optional git sha",
   "freeze": {
     "target": {
-      "decl_name": "MyProj.Mod.goal",
+      "decl_name": "MyProj.Namespace.goal",
       "module": "MyProj.Mod",
       "statement_hash": "123"
     },
@@ -125,11 +126,11 @@ python3 scripts/temporary_axiom_session.py cleanup
 `freeze` 的子字段语义：
 
 - `target`
-  本次 attempt 的目标定理，以及它冻结时的 statement hash。
+  本次 attempt 的目标定理，以及它冻结时的 statement hash。`target.decl_name` 是 Lean 的真实全限定声明名；`target.module` 是定义模块名。
 - `module_closure`
   为收集 permitted declarations 而考察过的项目内模块闭包。
 - `permitted_axioms`
-  允许携带 `@[temporary_axiom]` 的声明列表。
+  允许携带 `@[temporary_axiom]` 的声明列表。每条记录里的 `decl_name` 也是 Lean 的真实全限定声明名，而不是由模块名和短名机械拼接出来的字符串。
 
 `permitted_axioms[*].origin` 当前有两种来源：
 
@@ -155,7 +156,7 @@ python3 scripts/temporary_axiom_session.py cleanup
 流程：
 
 1. 解析 `--target`：
-   - 若是 `<module>:<decl>`，直接得到显式给出的模块和目标声明。
+   - 若是 `<module>:<decl>`，模块部分总是视为定义模块；声明部分若不含 `.`，则按“模块内短名”定向解析唯一匹配的声明，若含 `.`，则按完整声明名处理。
    - 若是 `<fully-qualified-decl>`，只按声明名前缀尝试有限个候选模块，不做仓库扫描。
 2. 获取 `prepare.lock`，拒绝并发的第二个 `prepare`。
 3. 读取 target 模块 `.ilean` 的 `directImports`，计算项目内 module closure。

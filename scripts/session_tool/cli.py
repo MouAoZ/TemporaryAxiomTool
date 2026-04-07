@@ -56,6 +56,7 @@ class SessionInspection:
 class TargetSpec:
     module_name: str | None
     decl_name: str
+    decl_is_short_name: bool
 
 
 def relative_path_str(project_root: Path, path: Path) -> str:
@@ -86,13 +87,13 @@ def parse_target_spec(target_spec: str) -> TargetSpec:
                 ],
                 hints=[
                     "使用 `--target <module>:<decl>` 或 `--target <fully-qualified-decl>`。",
-                    "例如：`--target MyProj.Section:goal`、`--target MyProj.Section:MyProj.Section.goal`、`--target MyProj.Section.goal`。",
+                    "例如：`--target MyProj.Section:goal`、`--target MyProj.Section:My.Namespace.goal`、`--target MyProj.Section.goal`。",
                 ],
             )
-        decl_name = decl_part if "." in decl_part else f"{module_name}.{decl_part}"
         return TargetSpec(
             module_name=module_name,
-            decl_name=decl_name,
+            decl_name=decl_part,
+            decl_is_short_name="." not in decl_part,
         )
     decl_name = target_spec.strip()
     if not decl_name or ":" in decl_name or "." not in decl_name:
@@ -103,12 +104,13 @@ def parse_target_spec(target_spec: str) -> TargetSpec:
             ],
             hints=[
                 "使用 `--target <module>:<decl>` 或 `--target <fully-qualified-decl>`。",
-                "例如：`--target MyProj.Section:goal`、`--target MyProj.Section:MyProj.Section.goal`、`--target MyProj.Section.goal`。",
+                "例如：`--target MyProj.Section:goal`、`--target MyProj.Section:My.Namespace.goal`、`--target MyProj.Section.goal`。",
             ],
         )
     return TargetSpec(
         module_name=None,
         decl_name=decl_name,
+        decl_is_short_name=False,
     )
 
 
@@ -444,6 +446,65 @@ def short_decl_name(decl_name: str) -> str:
     return decl_name.rsplit(".", 1)[-1]
 
 
+def resolve_decl_reference_in_module(
+    paths,
+    *,
+    module_name: str,
+    decl_name: str,
+    decl_is_short_name: bool,
+) -> tuple[str, dict[str, int]]:
+    if not decl_is_short_name:
+        range_info = try_decl_range_from_ilean(paths, module_name, decl_name)
+        if range_info is None:
+            fail(
+                "指定模块的 `.ilean` 中找不到目标声明。",
+                details=[
+                    f"目标声明：`{decl_name}`",
+                    f"目标模块：`{module_name}`",
+                ],
+                hints=[
+                    "这里的模块部分必须是声明的定义模块，而不只是 re-export 它的模块。",
+                    "如果你只有完整声明名，也可以直接使用 `--target <fully-qualified-decl>`。",
+                ],
+            )
+        return decl_name, range_info
+
+    matches = [
+        entry
+        for entry in module_decl_entries_from_ilean(paths, module_name)
+        if short_decl_name(str(entry["decl_name"])) == decl_name
+    ]
+    if not matches:
+        fail(
+            "指定模块中找不到该短名对应的目标声明。",
+            details=[
+                f"目标短名：`{decl_name}`",
+                f"目标模块：`{module_name}`",
+            ],
+            hints=[
+                "如果该声明名在 Lean 里带额外 namespace，可以改用 `--target <module>:<fully-qualified-decl>`。",
+            ],
+        )
+    if len(matches) > 1:
+        candidates = "\n".join(f"- {entry['decl_name']}" for entry in matches[:10])
+        details = [
+            f"目标短名：`{decl_name}`",
+            f"目标模块：`{module_name}`",
+            "匹配到多个声明：\n" + candidates,
+        ]
+        if len(matches) > 10:
+            details.append(f"其余候选：{len(matches) - 10} 个")
+        fail(
+            "指定模块中的目标短名不唯一。",
+            details=details,
+            hints=[
+                "请改用 `--target <module>:<fully-qualified-decl>` 明确指定目标声明。",
+            ],
+        )
+    match = matches[0]
+    return str(match["decl_name"]), match["range"]
+
+
 def is_strictly_before(lhs: dict[str, object], rhs: dict[str, object]) -> bool:
     return range_key(lhs) < range_key(rhs)
 
@@ -474,7 +535,13 @@ def ensure_decl_range_matches_source(
     )
 
 
-def resolve_target_decl(paths, *, decl_name: str, module_name: str | None) -> dict[str, object]:
+def resolve_target_decl(
+    paths,
+    *,
+    decl_name: str,
+    module_name: str | None,
+    decl_is_short_name: bool = False,
+) -> dict[str, object]:
     if module_name is not None:
         if not is_host_project_module(paths.project_root, module_name):
             fail(
@@ -488,30 +555,23 @@ def resolve_target_decl(paths, *, decl_name: str, module_name: str | None) -> di
                 ],
             )
         ensure_module_artifacts(paths, module_name)
-        range_info = try_decl_range_from_ilean(paths, module_name, decl_name)
-        if range_info is None:
-            fail(
-                "指定模块的 `.ilean` 中找不到目标声明。",
-                details=[
-                    f"目标声明：`{decl_name}`",
-                    f"目标模块：`{module_name}`",
-                ],
-                hints=[
-                    "这里的模块部分必须是声明的定义模块，而不只是 re-export 它的模块。",
-                    "如果你只有完整声明名，也可以直接使用 `--target <fully-qualified-decl>`。",
-                ],
-            )
+        resolved_decl_name, range_info = resolve_decl_reference_in_module(
+            paths,
+            module_name=module_name,
+            decl_name=decl_name,
+            decl_is_short_name=decl_is_short_name,
+        )
         target_path = module_name_to_path(paths.project_root, module_name)
         target_text = target_path.read_text(encoding="utf-8")
         ensure_decl_range_matches_source(
             module_name=module_name,
-            decl_name=decl_name,
+            decl_name=resolved_decl_name,
             relative_file=relative_path_str(paths.project_root, target_path),
             snippet=slice_text_for_decl(target_text, build_line_starts(target_text), range_info),
         )
         return probe_target_decl(
             paths,
-            decl_name=decl_name,
+            decl_name=resolved_decl_name,
             module_name=module_name,
             range_info=range_info,
         )
@@ -1278,6 +1338,7 @@ def prepare_session(args: argparse.Namespace, paths) -> None:
                 paths,
                 decl_name=requested_target.decl_name,
                 module_name=requested_target.module_name,
+                decl_is_short_name=requested_target.decl_is_short_name,
             )
             fail_existing_session_prepare(
                 paths,
@@ -1291,6 +1352,7 @@ def prepare_session(args: argparse.Namespace, paths) -> None:
             paths,
             decl_name=requested_target.decl_name,
             module_name=requested_target.module_name,
+            decl_is_short_name=requested_target.decl_is_short_name,
         )
         module_closure, permitted_axioms = collect_permitted_axioms(paths, target_info)
         base_commit = args.base_commit if args.base_commit is not None else try_git_head(paths)
@@ -1403,7 +1465,7 @@ def build_parser() -> argparse.ArgumentParser:
     prepare.add_argument(
         "--target",
         required=True,
-        help="Target spec. Accepts either `<module>:<decl>` or a fully qualified declaration name.",
+        help="Target spec. Accepts either `<module>:<short-decl-or-fully-qualified-decl>` or a fully qualified declaration name.",
     )
     prepare.add_argument(
         "--base-commit",
