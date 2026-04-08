@@ -1237,7 +1237,7 @@ def scan_managed_markers_in_files(
             if MANAGED_IMPORT_MARKER in line:
                 import_files.add(relative_file)
             if MANAGED_ATTR_PREFIX in line:
-                decl_name = line.partition(f"{MANAGED_ATTR_PREFIX} ")[2].strip()
+                decl_name = managed_attr_decl_name(line)
                 if decl_name:
                     attribute_markers[relative_file].add(decl_name)
     return import_files, dict(attribute_markers)
@@ -1362,6 +1362,19 @@ def attr_marker_line(decl_name: str) -> str:
     return f"@[temporary_axiom] {MANAGED_ATTR_PREFIX} {decl_name}"
 
 
+def attr_marker_block_comment(decl_name: str) -> str:
+    return f"/- {MANAGED_ATTR_PREFIX} {decl_name} -/"
+
+
+def managed_attr_decl_name(line: str) -> str | None:
+    if MANAGED_ATTR_PREFIX not in line:
+        return None
+    suffix = line.partition(f"{MANAGED_ATTR_PREFIX} ")[2].strip()
+    if not suffix:
+        return None
+    return suffix.split()[0]
+
+
 def compute_import_insertion_index(lines: list[str]) -> int:
     in_block_comment = False
     last_import_idx: int | None = None
@@ -1415,14 +1428,27 @@ def normalize_managed_line(line: str) -> list[str]:
         return []
     if MANAGED_ATTR_PREFIX not in line:
         return [line]
-    marker = f" {MANAGED_ATTR_PREFIX} "
-    if marker in line:
-        cleaned = line.replace(marker + line.partition(marker)[2], "", 1)
-    else:
-        cleaned = line.partition(MANAGED_ATTR_PREFIX)[0].rstrip()
-    cleaned = cleaned.replace("@[temporary_axiom, ", "@[", 1)
-    if cleaned.strip() == "@[temporary_axiom]":
+    decl_name = managed_attr_decl_name(line)
+    if decl_name is None:
+        return [line]
+    stripped = line.lstrip()
+    if stripped.startswith("@[temporary_axiom]"):
         return []
+    if stripped.startswith("temporary_axiom,"):
+        return []
+    cleaned = line.replace(attr_marker_block_comment(decl_name), "").rstrip()
+    marker = f" {MANAGED_ATTR_PREFIX} {decl_name}"
+    if marker in cleaned:
+        cleaned = cleaned.replace(marker, "", 1).rstrip()
+    cleaned = cleaned.replace("@[temporary_axiom, ", "@[", 1)
+    cleaned = re.sub(
+        r"\]\s+(?=(?:--|public\b|private\b|protected\b|noncomputable\b|unsafe\b|partial\b|local\b|scoped\b|theorem\b|axiom\b))",
+        "] ",
+        cleaned,
+    )
+    if cleaned.strip() == "@[":
+        indent = cleaned[: len(cleaned) - len(cleaned.lstrip())]
+        return [indent + "@["]
     return [cleaned.rstrip()]
 
 
@@ -1445,7 +1471,7 @@ def normalize_managed_text(text: str) -> tuple[str, bool]:
     return normalized_text, changed
 
 
-def attribute_insertion_index(lines: list[str], entry: dict[str, object]) -> int:
+def decl_header_bounds(lines: list[str], entry: dict[str, object]) -> tuple[int, int, int]:
     range_info = entry["range"]
     assert isinstance(range_info, dict)
     start_idx = int(range_info["line"]) - 1
@@ -1462,11 +1488,78 @@ def attribute_insertion_index(lines: list[str], entry: dict[str, object]) -> int
                 "这通常说明源码和 `.ilean` 不一致；请先重新构建相关模块。",
             ],
         )
-    header_end = min(selection_idx + 1, len(lines))
+    return start_idx, selection_idx, min(selection_idx + 1, len(lines))
+
+
+def existing_attribute_index(lines: list[str], entry: dict[str, object]) -> int | None:
+    start_idx, _, header_end = decl_header_bounds(lines, entry)
     for idx in range(max(0, start_idx), header_end):
         if lines[idx].lstrip().startswith("@["):
             return idx
-    return min(selection_idx, len(lines))
+    return None
+
+
+def attribute_insertion_index(lines: list[str], entry: dict[str, object]) -> int:
+    _, selection_idx, _ = decl_header_bounds(lines, entry)
+    attr_idx = existing_attribute_index(lines, entry)
+    if attr_idx is not None:
+        return attr_idx
+    return selection_idx
+
+
+def find_attr_block_close_in_line(line: str) -> int | None:
+    start = line.find("@[")
+    if start < 0:
+        return None
+    depth = 0
+    for idx in range(start, len(line)):
+        char = line[idx]
+        if char == "[":
+            depth += 1
+        elif char == "]":
+            depth -= 1
+            if depth == 0:
+                return idx
+    return None
+
+
+def attr_block_indent(lines: list[str], attr_idx: int, header_end: int) -> str:
+    for idx in range(attr_idx + 1, header_end):
+        stripped = lines[idx].lstrip()
+        if stripped and stripped != "]":
+            return lines[idx][: len(lines[idx]) - len(stripped)]
+    return "  "
+
+
+def patch_single_line_attr(line: str, decl_name: str) -> str:
+    close_idx = find_attr_block_close_in_line(line)
+    if close_idx is None:
+        fail(
+            "无法定位单行 attribute block 的结束位置。",
+            details=[f"声明：`{decl_name}`", f"源码：`{line.strip()}`"],
+        )
+    marker = f" {attr_marker_block_comment(decl_name)}"
+    patched = line.replace("@[", "@[temporary_axiom, ", 1)
+    delta = len("@[temporary_axiom, ") - len("@[")
+    insert_pos = close_idx + delta + 1
+    return patched[:insert_pos] + marker + patched[insert_pos:]
+
+
+def patch_existing_attribute_block(lines: list[str], entry: dict[str, object]) -> None:
+    decl_name = str(entry["decl_name"])
+    attr_idx = existing_attribute_index(lines, entry)
+    if attr_idx is None:
+        fail(
+            "内部错误：预期存在 attribute block，但未找到起始行。",
+            details=[f"声明：`{decl_name}`"],
+        )
+    _, _, header_end = decl_header_bounds(lines, entry)
+    attr_line = lines[attr_idx]
+    if find_attr_block_close_in_line(attr_line) is not None:
+        lines[attr_idx] = patch_single_line_attr(attr_line, decl_name)
+        return
+    indent = attr_block_indent(lines, attr_idx, header_end)
+    lines.insert(attr_idx + 1, f"{indent}temporary_axiom, {attr_marker_block_comment(decl_name)}")
 
 
 def decl_header_contains_temporary_axiom(text: str, line_starts: list[int], range_info: dict[str, int]) -> bool:
@@ -1527,8 +1620,12 @@ def add_managed_attributes(
         assert isinstance(range_info, dict)
         if decl_header_contains_temporary_axiom(text, line_starts, range_info):
             continue
-        lines.insert(attribute_insertion_index(lines, entry), attr_marker_line(decl_name))
-        inserted_for.append({"decl_name": decl_name, "mode": "inserted_line"})
+        if existing_attribute_index(lines, entry) is not None:
+            patch_existing_attribute_block(lines, entry)
+            inserted_for.append({"decl_name": decl_name, "mode": "patched_existing_attr"})
+        else:
+            lines.insert(attribute_insertion_index(lines, entry), attr_marker_line(decl_name))
+            inserted_for.append({"decl_name": decl_name, "mode": "inserted_line"})
     inserted_for.reverse()
     return inserted_for
 
@@ -1832,16 +1929,17 @@ def cleanup_session_artifacts(paths, edits: dict[str, Any]) -> None:
             if MANAGED_ATTR_PREFIX not in line:
                 updated.append(line)
                 continue
-            decl_name = line.partition(f"{MANAGED_ATTR_PREFIX} ")[2].strip()
+            decl_name = managed_attr_decl_name(line)
+            if decl_name is None:
+                updated.append(line)
+                continue
             mode = attr_modes.get(decl_name)
             if mode is None:
                 updated.append(line)
                 continue
             if mode == "inserted_line":
                 continue
-            cleaned = line.replace(f" {MANAGED_ATTR_PREFIX} {decl_name}", "")
-            cleaned = cleaned.replace("@[temporary_axiom, ", "@[", 1)
-            updated.append(cleaned)
+            updated.extend(normalize_managed_line(line))
         if updated != lines:
             write_lines(path, updated)
 

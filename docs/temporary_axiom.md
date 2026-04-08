@@ -170,7 +170,7 @@ python3 scripts/temporary_axiom_session.py cleanup
 9. 对目标声明和命中的 declaration 做 Lean probe，读取 statement hash。
 10. 写出 `Generated.lean` 与 `session.json`。
 11. 写出 `temporary_axiom_tool_session_report.txt`。
-12. 只在本次确实需要打标记的源码文件里插入 managed import 和独立的 managed `@[temporary_axiom]` 行；不会原地改写用户已有的属性行。如果声明头里本来就有 `temporary_axiom`，则直接复用，不重复插入。
+12. 只在本次确实需要打标记的源码文件里修改源码：没有现成 attr block 的声明会插入独立的 managed `@[temporary_axiom]` 行；已有 attr block 的声明会把 `temporary_axiom` 合并进原 block，并带上可清理的 managed 标记。如果声明头里本来就有 `temporary_axiom`，则直接复用，不重复插入。
 13. 立即用 `session.json`、generated runtime 和本次 edit log 做一次本地一致性自检。
 14. 删除 `prepare.lock`。
 
