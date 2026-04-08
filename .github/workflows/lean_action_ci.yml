@@ -16,6 +16,7 @@ jobs:
         run: python3 -m py_compile scripts/temporary_axiom_session.py scripts/session_tool/*.py
       - name: Session Roundtrip
         run: |
+          lake build TemporaryAxiomTool TemporaryAxiomTool.TestFixture.Target
           python3 scripts/temporary_axiom_session.py prepare \
             --target TemporaryAxiomTool.TestFixture.Target.goal
           lake build TemporaryAxiomTool.TestFixture.Target
