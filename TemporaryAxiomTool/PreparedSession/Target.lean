@@ -4,7 +4,7 @@ module
 Auto-generated prepared-session target runtime.
 This file is managed by TemporaryAxiomTool.
 -/
-public import TemporaryAxiomTool.PreparedSession
+public import TemporaryAxiomTool.TemporaryAxiom
 
 namespace TemporaryAxiomTool.PreparedSession.Target
 

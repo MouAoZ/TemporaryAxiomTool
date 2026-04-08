@@ -363,14 +363,17 @@ def generated_permitted_marker_decl_name(entry: dict[str, object]) -> str:
 def generated_target_source(*, target_decl: str | None) -> str:
     body = ""
     if target_decl is not None:
-        body = f"public axiom {generated_target_marker_decl_name(target_decl)} : True\n"
+        body = (
+            "@[temporary_axiom_target_runtime]\n"
+            f"public axiom {generated_target_marker_decl_name(target_decl)} : True\n"
+        )
     return (
         "module\n\n"
         "/-\n"
         "Auto-generated prepared-session target runtime.\n"
         "This file is managed by TemporaryAxiomTool.\n"
         "-/\n"
-        f"public import {TOOL_PREPARED_SESSION_MODULE}\n\n"
+        f"public import {TOOL_TEMPORARY_AXIOM_MODULE}\n\n"
         "namespace TemporaryAxiomTool.PreparedSession.Target\n\n"
         f"{body}\n"
         "end TemporaryAxiomTool.PreparedSession.Target\n"
@@ -384,7 +387,10 @@ def generated_permitted_module_source(
 ) -> str:
     entry_lines: list[str] = []
     for entry in sorted(permitted_axioms, key=lambda item: str(item["decl_name"])):
-        entry_lines.append(f"public axiom {generated_permitted_marker_decl_name(entry)} : True")
+        entry_lines.append(
+            "@[temporary_axiom_permitted_runtime]\n"
+            f"public axiom {generated_permitted_marker_decl_name(entry)} : True"
+        )
     permitted_payload = "\n".join(entry_lines)
     generated_module = generated_permitted_runtime_module_name(module_name)
     return (

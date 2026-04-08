@@ -110,12 +110,13 @@ private def decodeRuntimeStringComponent? (encoded : String) : Option String := 
     chars := chars.push (Char.ofNat codePoint)
   return String.ofList chars.toList
 
-private def parseGeneratedTargetDeclName? (constName : Name) : Option String := do
-  let encodedDecl ← stripStringPrefix? generatedTargetMarkerPrefix (toString constName)
-  decodeRuntimeStringComponent? encodedDecl
+private def parseGeneratedTargetDeclName? (declName : Name) : Option Name := do
+  let encodedDecl ← stripStringPrefix? generatedTargetMarkerPrefix (toString declName)
+  let declNameText ← decodeRuntimeStringComponent? encodedDecl
+  return declNameText.toName
 
-private def parseGeneratedPermittedAxiom? (constName : Name) : Option PermittedAxiom := do
-  let constNameText := toString constName
+private def parseGeneratedPermittedAxiom? (declName : Name) : Option PermittedAxiom := do
+  let constNameText := toString declName
   if !constNameText.startsWith generatedPermittedModulePrefix then
     failure
   match constNameText.splitOn generatedPermittedMarkerSegment with
@@ -131,29 +132,68 @@ private def parseGeneratedPermittedAxiom? (constName : Name) : Option PermittedA
       | _ => none
   | _ => none
 
-public def targetDeclNameText? : CoreM (Option String) := do
-  let env ← getEnv
-  for (constName, _) in env.constants do
-    if let some targetDeclName := parseGeneratedTargetDeclName? constName then
-      return some targetDeclName
-  return none
+public initialize targetRuntimeExt : SimplePersistentEnvExtension Name (Option Name) ←
+  registerSimplePersistentEnvExtension {
+    name := `temporaryAxiomTargetRuntimeExt
+    addEntryFn := fun _ declName => some declName
+    addImportedFn := fun importedEntries =>
+      importedEntries.foldl (init := none) fun state entries =>
+        entries.foldl (init := state) fun _ declName => some declName
+  }
+
+public initialize permittedAxiomRuntimeExt : SimplePersistentEnvExtension PermittedAxiom PermittedAxiomMap ←
+  registerSimplePersistentEnvExtension {
+    name := `temporaryAxiomPermittedRuntimeExt
+    addEntryFn := fun state entry => state.insert entry.declNameText entry
+    addImportedFn := fun importedEntries =>
+      importedEntries.foldl (init := {}) fun state entries =>
+        entries.foldl (init := state) fun state entry => state.insert entry.declNameText entry
+    replay? := some <|
+      SimplePersistentEnvExtension.replayOfFilter
+        (fun state entry => !state.contains entry.declNameText)
+        (fun state entry => state.insert entry.declNameText entry)
+  }
+
+public initialize targetRuntimeAttr : Unit ←
+  registerBuiltinAttribute {
+    name := `temporary_axiom_target_runtime
+    descr := "register generated prepared-session target runtime"
+    applicationTime := AttributeApplicationTime.afterCompilation
+    add := fun declName stx _kind => do
+      Attribute.Builtin.ensureNoArgs stx
+      let some targetDeclName := parseGeneratedTargetDeclName? declName
+        | throwError m!"invalid generated prepared-session target marker {declName}"
+      modifyEnv fun env => targetRuntimeExt.addEntry env targetDeclName
+    erase := fun _declName => pure ()
+  }
+
+public initialize permittedRuntimeAttr : Unit ←
+  registerBuiltinAttribute {
+    name := `temporary_axiom_permitted_runtime
+    descr := "register generated prepared-session permitted-axiom runtime"
+    applicationTime := AttributeApplicationTime.afterCompilation
+    add := fun declName stx _kind => do
+      Attribute.Builtin.ensureNoArgs stx
+      let some entry := parseGeneratedPermittedAxiom? declName
+        | throwError m!"invalid generated prepared-session permitted marker {declName}"
+      modifyEnv fun env => permittedAxiomRuntimeExt.addEntry env entry
+    erase := fun _declName => pure ()
+  }
 
 public def targetName : CoreM Name := do
-  let some targetNameText ← targetDeclNameText? | return Name.anonymous
-  if targetNameText.isEmpty then
-    return Name.anonymous
-  return targetNameText.toName
+  return targetRuntimeExt.getState (← getEnv) |>.getD Name.anonymous
+
+public def targetDeclNameText? : CoreM (Option String) := do
+  let frozenTargetName ← targetName
+  if frozenTargetName == Name.anonymous then
+    return none
+  return some (toString frozenTargetName)
 
 public def hasActiveSession : CoreM Bool := do
-  return (← targetDeclNameText?).isSome
+  return (← targetName) != Name.anonymous
 
 public def permittedAxiomMap : CoreM PermittedAxiomMap := do
-  let env ← getEnv
-  let mut result : PermittedAxiomMap := {}
-  for (constName, _) in env.constants do
-    let some entry := parseGeneratedPermittedAxiom? constName | continue
-    result := result.insert entry.declNameText entry
-  return result
+  return permittedAxiomRuntimeExt.getState (← getEnv)
 
 public def permittedAxiomFor? (declName : Name) : CoreM (Option PermittedAxiom) := do
   return (← permittedAxiomMap).get? (toString declName)

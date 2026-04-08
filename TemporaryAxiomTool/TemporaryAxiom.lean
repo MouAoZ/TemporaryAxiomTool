@@ -85,16 +85,17 @@ Suggested fixes:\n
 这样能拦住隐式参数、universe 或命名空间解析导致的真实陈述漂移。
 -/
 private meta def validateTemporaryAxiomTarget (declName : Name) : AttrM Unit := do
-  let some frozenTargetText ← targetDeclNameText? | do
+  let frozenTargetName ← targetName
+  if frozenTargetName == Name.anonymous then
     throwError (noActivePreparedSessionMessage declName)
-  if toString declName == frozenTargetText then
+  if declName == frozenTargetName then
     throwError (targetTheoremTaggedMessage declName)
   let constInfo ← getConstInfo declName
   let permittedEntry ← match (← permittedEntryFor declName) with
     | some entry => pure entry
     | none =>
         throwError m!"{declarationNotPermittedMessage declName}\n
-Frozen target: {frozenTargetText}"
+Frozen target: {frozenTargetName}"
   -- 这里使用真正写入环境的常量信息计算 hash，确保比较对象与 Lean 内部语义一致。
   let actualHash := TemporaryAxiomTool.statementHashOfConstInfo constInfo
   if actualHash != permittedEntry.statementHash then
