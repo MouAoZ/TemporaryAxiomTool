@@ -6,7 +6,7 @@ public meta import Lean.Elab.Command
 public meta import Lean.Elab.Term
 public import TemporaryAxiomTool.StatementHash
 public import TemporaryAxiomTool.PreparedSession.Types
-import TemporaryAxiomTool.PreparedSession.Generated
+public meta import TemporaryAxiomTool.PreparedSession.Types
 public meta import TemporaryAxiomTool.StatementHash
 
 open Lean Elab Command
@@ -77,16 +77,85 @@ elab "#print_temporary_axiom_decl_probe " quotedName:term : command => do
         moduleName
         (TemporaryAxiomTool.statementHashOfConstInfo constInfo)).compress
 
-public def targetName : Name :=
-  generatedTargetName
+private def generatedTargetMarkerPrefix : String :=
+  "TemporaryAxiomTool.PreparedSession.Target.target_decl_"
 
-public def permittedAxioms : Array PermittedAxiom :=
-  generatedPermittedAxioms
+private def generatedPermittedModulePrefix : String :=
+  "TemporaryAxiomTool.PreparedSession.Permitted."
 
-public def hasActiveSession : Bool :=
-  targetName != Name.anonymous
+private def generatedPermittedMarkerSegment : String :=
+  ".permitted_decl_"
 
-public def permittedAxiomMap : PermittedAxiomMap :=
-  insertPermittedAxioms {} permittedAxioms
+private def generatedPermittedHashSegment : String :=
+  "__hash_"
+
+private def encodedRuntimeStringPrefix : String :=
+  "u_"
+
+private def stripStringPrefix? (pre text : String) : Option String :=
+  if text.startsWith pre then
+    some (text.drop pre.length |>.toString)
+  else
+    none
+
+private def decodeRuntimeStringComponent? (encoded : String) : Option String := do
+  let payload ← stripStringPrefix? encodedRuntimeStringPrefix encoded
+  if payload == "empty" then
+    return ""
+  let mut chars : Array Char := #[]
+  for codeText in payload.splitOn "_" do
+    if codeText.isEmpty then
+      failure
+    let codePoint ← codeText.toNat?
+    chars := chars.push (Char.ofNat codePoint)
+  return String.ofList chars.toList
+
+private def parseGeneratedTargetDeclName? (constName : Name) : Option String := do
+  let encodedDecl ← stripStringPrefix? generatedTargetMarkerPrefix (toString constName)
+  decodeRuntimeStringComponent? encodedDecl
+
+private def parseGeneratedPermittedAxiom? (constName : Name) : Option PermittedAxiom := do
+  let constNameText := toString constName
+  if !constNameText.startsWith generatedPermittedModulePrefix then
+    failure
+  match constNameText.splitOn generatedPermittedMarkerSegment with
+  | [_modulePart, markerPayload] =>
+      match markerPayload.splitOn generatedPermittedHashSegment with
+      | [encodedDecl, statementHash] =>
+          let declNameText ← decodeRuntimeStringComponent? encodedDecl
+          let hashNat ← statementHash.toNat?
+          some {
+            declNameText := declNameText
+            statementHash := hashNat.toUInt64
+          }
+      | _ => none
+  | _ => none
+
+public def targetDeclNameText? : CoreM (Option String) := do
+  let env ← getEnv
+  for (constName, _) in env.constants do
+    if let some targetDeclName := parseGeneratedTargetDeclName? constName then
+      return some targetDeclName
+  return none
+
+public def targetName : CoreM Name := do
+  let some targetNameText ← targetDeclNameText? | return Name.anonymous
+  if targetNameText.isEmpty then
+    return Name.anonymous
+  return targetNameText.toName
+
+public def hasActiveSession : CoreM Bool := do
+  return (← targetDeclNameText?).isSome
+
+public def permittedAxiomMap : CoreM PermittedAxiomMap := do
+  let env ← getEnv
+  let mut result : PermittedAxiomMap := {}
+  for (constName, _) in env.constants do
+    let some entry := parseGeneratedPermittedAxiom? constName | continue
+    result := result.insert entry.declNameText entry
+  return result
+
+public def permittedAxiomFor? (declName : Name) : CoreM (Option PermittedAxiom) := do
+  return (← permittedAxiomMap).get? (toString declName)
 
 end TemporaryAxiomTool.PreparedSession

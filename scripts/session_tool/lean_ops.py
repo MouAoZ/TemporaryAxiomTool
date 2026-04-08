@@ -9,7 +9,10 @@ from pathlib import Path
 from .common import (
     TOOL_NAMESPACE,
     TOOL_PREPARED_SESSION_MODULE,
+    TOOL_PREPARED_SESSION_PERMITTED_MODULE_PREFIX,
+    TOOL_PREPARED_SESSION_TARGET_MODULE,
     TOOL_PREPARED_SESSION_TYPES_MODULE,
+    TOOL_TEMPORARY_AXIOM_MODULE,
     ensure_layout,
     fail,
     module_name_to_relative_path,
@@ -330,72 +333,148 @@ def try_probe_decl_in_module(paths, module_name: str, decl_name: str) -> dict[st
     return payloads[0]
 
 
-def probe_named_declarations_with_imports(
-    paths,
-    *,
-    imports: list[str],
-    decl_names: list[str],
-    description: str,
-) -> list[dict[str, object]]:
-    if not decl_names:
-        return []
-    payloads: list[dict[str, object]] = []
-    chunk_size = 200
-    for start in range(0, len(decl_names), chunk_size):
-        chunk = decl_names[start:start + chunk_size]
-        _, chunk_payloads = run_lean_probe(
-            paths,
-            imports=imports,
-            command_lines=[
-                f"#print_temporary_axiom_decl_probe {lean_name_literal(decl_name)}"
-                for decl_name in chunk
-            ],
-            description=description,
-            allow_failure=False,
-        )
-        payloads.extend(chunk_payloads)
-    return payloads
+def generated_permitted_runtime_module_name(module_name: str) -> str:
+    return f"{TOOL_PREPARED_SESSION_PERMITTED_MODULE_PREFIX}.{module_name}"
 
 
-def generated_runtime_source(*, target_decl: str | None, permitted_axioms: list[dict[str, object]]) -> str:
-    entry_lines: list[str] = []
-    for entry in permitted_axioms:
-        entry_lines.append(
-            "  {\n"
-            f"    name := `{entry['decl_name']}\n"
-            f"    statementHash := ({entry['statement_hash']} : UInt64)\n"
-            "  }"
-        )
-    entries_block = ",\n".join(entry_lines)
-    target_name_expr = "Lean.Name.anonymous" if target_decl is None else f"`{target_decl}"
-    permitted_array = "#[]" if not entry_lines else f"#[\n{entries_block}\n]"
+def generated_permitted_runtime_path(paths, module_name: str) -> Path:
+    return paths.project_root / module_name_to_relative_path(
+        generated_permitted_runtime_module_name(module_name)
+    )
+
+
+def encode_runtime_name_component(text: str) -> str:
+    encoded_points = "_".join(str(ord(ch)) for ch in text)
+    return f"u_{encoded_points}" if encoded_points else "u_empty"
+
+
+def generated_target_marker_decl_name(target_decl: str) -> str:
+    return f"target_decl_{encode_runtime_name_component(target_decl)}"
+
+
+def generated_permitted_marker_decl_name(entry: dict[str, object]) -> str:
+    decl_name = str(entry["decl_name"])
+    statement_hash = str(entry["statement_hash"])
+    return (
+        f"permitted_decl_{encode_runtime_name_component(decl_name)}__hash_{statement_hash}"
+    )
+
+
+def generated_target_source(*, target_decl: str | None) -> str:
+    body = ""
+    if target_decl is not None:
+        body = f"public axiom {generated_target_marker_decl_name(target_decl)} : True\n"
     return (
         "module\n\n"
         "/-\n"
-        "Auto-generated prepared-session runtime.\n"
+        "Auto-generated prepared-session target runtime.\n"
         "This file is managed by TemporaryAxiomTool.\n"
         "-/\n"
-        f"public import {TOOL_PREPARED_SESSION_TYPES_MODULE}\n\n"
-        "namespace TemporaryAxiomTool.PreparedSession\n\n"
-        f"public def generatedTargetName : Lean.Name := {target_name_expr}\n\n"
-        f"public def generatedPermittedAxioms : Array PermittedAxiom := {permitted_array}\n\n"
-        "end TemporaryAxiomTool.PreparedSession\n"
+        f"public import {TOOL_PREPARED_SESSION_MODULE}\n\n"
+        "namespace TemporaryAxiomTool.PreparedSession.Target\n\n"
+        f"{body}\n"
+        "end TemporaryAxiomTool.PreparedSession.Target\n"
     )
+
+
+def generated_permitted_module_source(
+    *,
+    module_name: str,
+    permitted_axioms: list[dict[str, object]],
+) -> str:
+    entry_lines: list[str] = []
+    for entry in sorted(permitted_axioms, key=lambda item: str(item["decl_name"])):
+        entry_lines.append(f"public axiom {generated_permitted_marker_decl_name(entry)} : True")
+    permitted_payload = "\n".join(entry_lines)
+    generated_module = generated_permitted_runtime_module_name(module_name)
+    return (
+        "module\n\n"
+        "/-\n"
+        "Auto-generated prepared-session permitted axioms.\n"
+        "This file is managed by TemporaryAxiomTool.\n"
+        "-/\n"
+        f"public import {TOOL_TEMPORARY_AXIOM_MODULE}\n"
+        f"public import {TOOL_PREPARED_SESSION_TARGET_MODULE}\n\n"
+        f"namespace {generated_module}\n\n"
+        f"{permitted_payload}\n\n"
+        f"end {generated_module}\n"
+    )
+
+
+def generated_session_sources(
+    paths,
+    *,
+    target_decl: str | None,
+    permitted_axioms: list[dict[str, object]],
+) -> dict[Path, str]:
+    grouped: dict[str, list[dict[str, object]]] = {}
+    for entry in permitted_axioms:
+        grouped.setdefault(str(entry["module"]), []).append(entry)
+    sources: dict[Path, str] = {
+        paths.generated_target_file: generated_target_source(target_decl=target_decl),
+    }
+    for module_name, module_entries in sorted(grouped.items()):
+        sources[generated_permitted_runtime_path(paths, module_name)] = generated_permitted_module_source(
+            module_name=module_name,
+            permitted_axioms=module_entries,
+        )
+    return sources
 
 
 def write_generated_runtime(paths, *, target_decl: str, permitted_axioms: list[dict[str, object]]) -> None:
     ensure_layout(paths)
-    source = generated_runtime_source(
+    sources = generated_session_sources(
+        paths,
         target_decl=target_decl,
         permitted_axioms=permitted_axioms,
     )
-    paths.generated_session_file.write_text(source, encoding="utf-8")
+    for path, source in sources.items():
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(source, encoding="utf-8")
+    expected_paths = set(sources)
+    for path in sorted(paths.generated_permitted_root.rglob("*.lean")):
+        if path not in expected_paths:
+            path.unlink(missing_ok=True)
+    for directory in sorted(paths.generated_permitted_root.rglob("*"), reverse=True):
+        if directory.is_dir():
+            try:
+                directory.rmdir()
+            except OSError:
+                pass
+    paths.legacy_generated_session_file.unlink(missing_ok=True)
+
+
+def write_generated_permitted_runtime(
+    paths,
+    *,
+    module_name: str,
+    permitted_axioms: list[dict[str, object]],
+) -> None:
+    ensure_layout(paths)
+    path = generated_permitted_runtime_path(paths, module_name)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        generated_permitted_module_source(
+            module_name=module_name,
+            permitted_axioms=permitted_axioms,
+        ),
+        encoding="utf-8",
+    )
 
 
 def reset_generated_runtime(paths) -> None:
     ensure_layout(paths)
-    source = generated_runtime_source(
-        target_decl=None,
-        permitted_axioms=[],
+    paths.generated_target_file.write_text(
+        generated_target_source(target_decl=None),
+        encoding="utf-8",
     )
-    paths.generated_session_file.write_text(source, encoding="utf-8")
+    for path in sorted(paths.generated_permitted_root.rglob("*.lean")):
+        path.unlink(missing_ok=True)
+    for directory in sorted(paths.generated_permitted_root.rglob("*"), reverse=True):
+        if directory.is_dir():
+            try:
+                directory.rmdir()
+            except OSError:
+                pass
+    paths.generated_permitted_root.mkdir(parents=True, exist_ok=True)
+    paths.legacy_generated_session_file.unlink(missing_ok=True)

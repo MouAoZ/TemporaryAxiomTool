@@ -63,7 +63,7 @@ freeze = session["freeze"]
 `prepare` 会做三类事：
 
 - 冻结这次尝试要使用的信息：target theorem、module closure、允许临时公理化的声明及其 statement hash。
-- 生成 Lean 侧 runtime：把冻结结果写入 `TemporaryAxiomTool/PreparedSession/Generated.lean`。
+- 生成 Lean 侧 runtime：把冻结结果写入 `TemporaryAxiomTool/PreparedSession/Target.lean` 和 `TemporaryAxiomTool/PreparedSession/Permitted/**/*.lean`。
 - 对源码做受控修改：预检和源码扫描会忽略上一次没清干净的 tool-managed 残留；真正落盘时，只修改这次确实需要打标记的源码文件。没有现成 attr block 的声明会插入独立的 managed `@[temporary_axiom]` 行；已有 attr block 的声明会把 `temporary_axiom` 合并进原 block。
 
 `prepare` 完成后，还会给用户输出一份摘要：

@@ -12,6 +12,8 @@ TOOL_NAMESPACE = "TemporaryAxiomTool"
 TOOL_TEMPORARY_AXIOM_MODULE = f"{TOOL_NAMESPACE}.TemporaryAxiom"
 TOOL_PREPARED_SESSION_MODULE = f"{TOOL_NAMESPACE}.PreparedSession"
 TOOL_PREPARED_SESSION_TYPES_MODULE = f"{TOOL_PREPARED_SESSION_MODULE}.Types"
+TOOL_PREPARED_SESSION_TARGET_MODULE = f"{TOOL_PREPARED_SESSION_MODULE}.Target"
+TOOL_PREPARED_SESSION_PERMITTED_MODULE_PREFIX = f"{TOOL_PREPARED_SESSION_MODULE}.Permitted"
 DEFAULT_SESSION_DIRNAME = ".temporary_axiom_session"
 DEFAULT_REPORT_FILENAME = "temporary_axiom_tool_session_report.txt"
 MANAGED_IMPORT_MARKER = "-- temporary_axiom_tool managed import"
@@ -28,7 +30,9 @@ class SessionPaths:
     prepare_lock_file: Path
     report_file: Path
     lean_prepared_session_root: Path
-    generated_session_file: Path
+    generated_target_file: Path
+    generated_permitted_root: Path
+    legacy_generated_session_file: Path
     lean_build_lib_root: Path
     build_target: str
 
@@ -43,7 +47,9 @@ def make_paths(project_root: Path) -> SessionPaths:
         prepare_lock_file=session_root / "prepare.lock",
         report_file=project_root / DEFAULT_REPORT_FILENAME,
         lean_prepared_session_root=lean_prepared_session_root,
-        generated_session_file=lean_prepared_session_root / "Generated.lean",
+        generated_target_file=lean_prepared_session_root / "Target.lean",
+        generated_permitted_root=lean_prepared_session_root / "Permitted",
+        legacy_generated_session_file=lean_prepared_session_root / "Generated.lean",
         lean_build_lib_root=project_root / ".lake" / "build" / "lib" / "lean",
         build_target=TOOL_NAMESPACE,
     )
@@ -52,6 +58,7 @@ def make_paths(project_root: Path) -> SessionPaths:
 def ensure_layout(paths: SessionPaths) -> None:
     paths.session_root.mkdir(parents=True, exist_ok=True)
     paths.lean_prepared_session_root.mkdir(parents=True, exist_ok=True)
+    paths.generated_permitted_root.mkdir(parents=True, exist_ok=True)
 
 
 def acquire_prepare_lock(paths: SessionPaths) -> None:

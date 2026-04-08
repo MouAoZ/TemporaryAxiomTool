@@ -35,10 +35,11 @@ private meta def ensureTemporaryAxiomNoArgs (stx : Syntax) : AttrM Unit := do
 /--
 只从已导入环境中的当前 session runtime 读取 permitted axioms。
 
-JSON 到 Lean 的同步由离线脚本完成；这里始终只认生成后的 prepared-session runtime。
+JSON 到 Lean 的同步由离线脚本完成；这里始终只认当前环境里注册过的 target /
+permitted axioms。
 -/
-private meta def permittedEntryFor (declName : Name) : Option PermittedAxiom :=
-  permittedAxiomMap.find? declName
+private meta def permittedEntryFor (declName : Name) : AttrM (Option PermittedAxiom) := do
+  permittedAxiomFor? declName
 
 -- 报错正文保持英文，便于直接出现在 Lean/CI 输出中；这里不拼双语长消息。
 private meta def invalidTemporaryAxiomTargetHeader (declName : Name) : MessageData :=
@@ -61,7 +62,6 @@ Suggested fixes:\n
 private meta def declarationNotPermittedMessage (declName : Name) : MessageData :=
   m!"{invalidTemporaryAxiomTargetHeader declName}\n
 The declaration is not listed in the current session's permitted axioms.\n
-Frozen target: {.ofConstName targetName}\n
 Suggested fixes:\n
 - remove the attribute from this declaration\n
 - or regenerate the prepared session so the permitted set is refreshed"
@@ -85,15 +85,16 @@ Suggested fixes:\n
 这样能拦住隐式参数、universe 或命名空间解析导致的真实陈述漂移。
 -/
 private meta def validateTemporaryAxiomTarget (declName : Name) : AttrM Unit := do
-  if !hasActiveSession then
+  let some frozenTargetText ← targetDeclNameText? | do
     throwError (noActivePreparedSessionMessage declName)
-  if declName == targetName then
+  if toString declName == frozenTargetText then
     throwError (targetTheoremTaggedMessage declName)
   let constInfo ← getConstInfo declName
-  let permittedEntry ← match permittedEntryFor declName with
+  let permittedEntry ← match (← permittedEntryFor declName) with
     | some entry => pure entry
     | none =>
-        throwError (declarationNotPermittedMessage declName)
+        throwError m!"{declarationNotPermittedMessage declName}\n
+Frozen target: {frozenTargetText}"
   -- 这里使用真正写入环境的常量信息计算 hash，确保比较对象与 Lean 内部语义一致。
   let actualHash := TemporaryAxiomTool.statementHashOfConstInfo constInfo
   if actualHash != permittedEntry.statementHash then

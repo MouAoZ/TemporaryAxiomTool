@@ -29,14 +29,14 @@ from .lean_ops import (
     compute_text_file_hashes,
     compute_text_hashes_for_texts,
     ensure_probe_tool_ready,
-    generated_runtime_source,
+    generated_permitted_runtime_module_name,
+    generated_session_sources,
     module_artifact_path,
-    probe_named_declarations_with_imports,
     reset_generated_runtime,
     run_command,
-    run_lean_source,
     try_git_head,
     try_probe_decl_in_module,
+    write_generated_permitted_runtime,
     write_generated_runtime,
 )
 
@@ -50,6 +50,7 @@ TEMP_AXIOM_HASH_MISMATCH_RE = re.compile(
     r"Expected hash: (?P<expected>\d+)\n\n"
     r"Actual hash:\s+(?P<actual>\d+)"
 )
+PLACEHOLDER_STATEMENT_HASH = "0"
 INLINE_MODULE_LIST_LIMIT = 10
 INLINE_PERMITTED_AXIOM_LIMIT = 12
 DECL_MODIFIER_TOKENS = {
@@ -63,87 +64,14 @@ DECL_MODIFIER_TOKENS = {
     "scoped",
 }
 
-AXIOM_PROBE_HELPER_SOURCE = """open Lean Elab Command Term
-
-private meta def temporaryAxiomProbeJson
-    (declName : Name)
-    (moduleName : Name)
-    (statementHash : UInt64) : Json :=
-  Json.mkObj [
-    ("decl_name", Json.str <| toString declName),
-    ("module", Json.str <| toString moduleName),
-    ("statement_hash", Json.str <| toString statementHash.toNat)
-  ]
-
-private meta def isSupportedTemporaryAxiomProbeConstInfo (constInfo : ConstantInfo) : Bool :=
-  match constInfo with
-  | .thmInfo _ => true
-  | .opaqueInfo _ => true
-  | .axiomInfo _ => true
-  | _ => false
-
-syntax (name := Parser.Attr.temporary_axiom) "temporary_axiom" : attr
-
-builtin_initialize registerBuiltinAttribute {
-    name := `temporary_axiom
-    descr := "temporary axiom probe attribute"
-    applicationTime := AttributeApplicationTime.afterTypeChecking
-    add := fun _declName _stx _kind => pure ()
-    erase := fun _declName => pure ()
-  }
-
-private meta def isTemporaryAxiomAttr (attrInstance : Syntax) : Bool :=
-  if attrInstance.getKind != ``Parser.Term.attrInstance then
-    false
-  else
-    let attr := attrInstance[1]
-    attr.getKind == ``Parser.Attr.temporary_axiom ||
-      (attr.getKind == ``Parser.Attr.simple &&
-        attr[0].getId.eraseMacroScopes == `temporary_axiom &&
-        attr[1].isNone &&
-        attr[2].isNone)
-
-private meta def hasTemporaryAxiomAttr (modifiers : Syntax) : Bool :=
-  if modifiers.getKind != ``Parser.Command.declModifiers then
-    false
-  else
-    let attrsOpt := modifiers[1]
-    if attrsOpt.isNone then
-      false
-    else
-      let attrs := attrsOpt[0][1].getSepArgs
-      attrs.any isTemporaryAxiomAttr
-
-macro_rules
-  (kind := Lean.Parser.Command.declaration)
-  | `($modifiers:declModifiers theorem $declId:declId $declSig:declSig $_:declVal) => do
-      if !hasTemporaryAxiomAttr modifiers then
-        Macro.throwUnsupported
-      `(command| $modifiers:declModifiers axiom $declId:declId $declSig:declSig)
-
-elab "#print_axiomized_decl_probe " quotedName:term " in " quotedModule:term : command => do
-  let declName ← liftTermElabM do
-    unsafe Term.evalTerm Name (mkConst ``Name) quotedName
-  let moduleName ← liftTermElabM do
-    unsafe Term.evalTerm Name (mkConst ``Name) quotedModule
-  let env ← getEnv
-  let some constInfo := env.find? declName | pure ()
-  if isSupportedTemporaryAxiomProbeConstInfo constInfo then
-    liftIO <| IO.println <|
-      (temporaryAxiomProbeJson
-        declName
-        moduleName
-        (TemporaryAxiomTool.statementHashOfConstInfo constInfo)).compress
-"""
-
 
 @dataclass(frozen=True)
 class SessionInspection:
     session_exists: bool
     session_payload: dict[str, Any] | None
-    runtime_matches_session: bool
-    runtime_is_reset: bool
-    import_files: set[str]
+    generated_matches_session: bool
+    generated_is_reset: bool
+    managed_imports: dict[str, set[str]]
     attribute_markers: dict[str, set[str]]
 
 
@@ -274,6 +202,14 @@ def summarize_attribute_markers(attribute_markers: dict[str, set[str]]) -> list[
     return lines
 
 
+def summarize_managed_imports(managed_imports: dict[str, set[str]]) -> list[str]:
+    lines: list[str] = []
+    for relative_file in sorted(managed_imports):
+        imports = ", ".join(sorted(managed_imports[relative_file]))
+        lines.append(f"`{relative_file}`: {imports}")
+    return lines
+
+
 def group_permitted_axioms_by_module(
     permitted_axioms: list[dict[str, object]],
 ) -> dict[str, list[dict[str, str]]]:
@@ -329,7 +265,8 @@ def session_report_text(
     lines.append("Artifacts")
     lines.append("- session.json: freeze data for verifier/comparator and cleanup edit log")
     lines.append("- temporary_axiom_tool_session_report.txt: human-readable session summary")
-    lines.append("- TemporaryAxiomTool/PreparedSession/Generated.lean: generated Lean runtime")
+    lines.append("- TemporaryAxiomTool/PreparedSession/Target.lean: generated target runtime")
+    lines.append("- TemporaryAxiomTool/PreparedSession/Permitted/**/*.lean: generated permitted-axiom shards")
     return "\n".join(lines) + "\n"
 
 
@@ -946,176 +883,6 @@ def compute_module_closure(paths, target_module: str) -> list[str]:
     return ordered
 
 
-def collect_probed_declarations(
-    paths,
-    *,
-    imports: list[str],
-    candidates: list[dict[str, object]],
-) -> list[dict[str, object]]:
-    if not candidates:
-        return []
-    requested_decl_names = [str(entry["decl_name"]) for entry in candidates]
-    raw_payloads = probe_named_declarations_with_imports(
-        paths,
-        imports=imports,
-        decl_names=requested_decl_names,
-        description="批量探测 prepared session 中的声明",
-    )
-    by_name = {str(payload["decl_name"]): payload for payload in raw_payloads}
-    missing_decl_names = [
-        decl_name for decl_name in requested_decl_names if decl_name not in by_name
-    ]
-    if missing_decl_names:
-        preview = missing_decl_names[:10]
-        details = [
-            f"缺失数量：{len(missing_decl_names)}",
-            "缺失声明：\n" + "\n".join(f"- {decl_name}" for decl_name in preview),
-        ]
-        if len(missing_decl_names) > len(preview):
-            details.append(f"其余缺失条目：{len(missing_decl_names) - len(preview)} 个")
-        fail(
-            "Lean probe 没有返回全部候选声明。",
-            details=details,
-            hints=[
-                "这通常说明当前源码、模块产物和导入环境不一致。",
-                "先重新构建相关模块，再重新运行 `prepare`。",
-            ],
-        )
-    normalized: list[dict[str, object]] = []
-    for entry in candidates:
-        decl_name = str(entry["decl_name"])
-        payload = by_name.get(decl_name)
-        if payload is None:
-            continue
-        payload_module = str(payload["module"])
-        if payload_module != str(entry["module"]):
-            fail(
-                "Lean probe 返回的模块与 `.ilean` 记录不一致。",
-                details=[
-                    f"声明：`{decl_name}`",
-                    f"`.ilean` 记录模块：`{entry['module']}`",
-                    f"Lean probe 返回模块：`{payload_module}`",
-                ],
-            )
-        normalized.append(
-            normalize_probed_decl(
-                payload,
-                module_name=str(entry["module"]),
-                relative_file=str(entry["file"]),
-                range_info=entry["range"],
-            )
-        )
-    return normalized
-
-
-def build_axiom_probe_source(
-    *,
-    prefix_source: str,
-    file_entries: list[dict[str, object]],
-    decl_names: list[str],
-) -> str:
-    lines = prefix_source.splitlines()
-    add_managed_attributes(
-        text=prefix_source,
-        lines=lines,
-        file_entries=file_entries,
-    )
-    insert_idx = compute_import_insertion_index(lines)
-    source_lines: list[str] = []
-    source_lines.extend(lines[:insert_idx])
-    source_lines.append("public import Lean.Attributes")
-    source_lines.append("public meta import TemporaryAxiomTool.StatementHash")
-    source_lines.append("public meta import Lean.Attributes")
-    source_lines.append("public meta import Lean.Elab.Command")
-    source_lines.append("public meta import Lean.Elab.Term")
-    source_lines.append("")
-    source_lines.extend(AXIOM_PROBE_HELPER_SOURCE.splitlines())
-    source_lines.append("")
-    source_lines.extend(lines[insert_idx:])
-    source_lines.append("")
-    for entry in file_entries:
-        source_lines.append(
-            f"#print_axiomized_decl_probe `{entry['decl_name']} in `{entry['module']}"
-        )
-    return "\n".join(source_lines) + "\n"
-
-
-def collect_axiomized_probed_declarations(
-    paths,
-    *,
-    candidates: list[dict[str, object]],
-) -> list[dict[str, object]]:
-    if not candidates:
-        return []
-    grouped: dict[str, list[dict[str, object]]] = defaultdict(list)
-    for entry in candidates:
-        grouped[str(entry["module"])].append(entry)
-    normalized: list[dict[str, object]] = []
-    for module_name, module_entries in sorted(grouped.items()):
-        source_text = normalized_module_source_text(paths, module_name)
-        line_starts = normalized_module_source_line_starts(paths, module_name)
-        replay_end = max(
-            offset_for_line_column(
-                source_text,
-                line_starts,
-                int(entry["range"]["end_line"]),
-                int(entry["range"]["end_column"]),
-            )
-            for entry in module_entries
-        )
-        prefix_source = source_text[:replay_end]
-        decl_names = [str(entry["decl_name"]) for entry in module_entries]
-        result, payloads = run_lean_source(
-            paths,
-            source=build_axiom_probe_source(
-                prefix_source=prefix_source,
-                file_entries=module_entries,
-                decl_names=decl_names,
-            ),
-            description=f"按 axiom 语义探测模块 `{module_name}` 中的 permitted declarations",
-            allow_failure=True,
-        )
-        payload_by_name = {str(payload["decl_name"]): payload for payload in payloads}
-        missing_decl_names = [
-            decl_name for decl_name in decl_names if decl_name not in payload_by_name
-        ]
-        if missing_decl_names:
-            preview = missing_decl_names[:10]
-            details = [
-                f"模块：`{module_name}`",
-                f"缺失数量：{len(missing_decl_names)}",
-                "缺失声明：\n" + "\n".join(f"- {decl_name}" for decl_name in preview),
-            ]
-            if result.returncode != 0:
-                output = "\n".join(
-                    part for part in [result.stdout.strip(), result.stderr.strip()] if part
-                )
-                if output:
-                    details.append("临时 probe 输出：\n" + output)
-            if len(missing_decl_names) > len(preview):
-                details.append(f"其余缺失条目：{len(missing_decl_names) - len(preview)} 个")
-            fail(
-                "axiom probe 没有返回全部候选声明。",
-                details=details,
-                hints=[
-                    "这通常说明临时回放的源码前缀没有成功重建所需上下文。",
-                    "先检查对应模块里是否存在非常规 theorem 头语法，或近期是否刚改过源码但未重建。",
-                ],
-            )
-        for entry in module_entries:
-            decl_name = str(entry["decl_name"])
-            payload = payload_by_name[decl_name]
-            normalized.append(
-                normalize_probed_decl(
-                    payload,
-                    module_name=str(entry["module"]),
-                    relative_file=str(entry["file"]),
-                    range_info=entry["range"],
-                )
-            )
-    return normalized
-
-
 @lru_cache(maxsize=None)
 def module_decl_entries_from_ilean(paths, module_name: str) -> list[dict[str, object]]:
     metadata = load_ilean_metadata(paths, module_name)
@@ -1333,15 +1100,15 @@ def collect_permitted_axioms(paths, target_info: dict[str, object]) -> tuple[lis
                 continue
             candidate_entries.append(entry)
     permitted_by_name: dict[str, dict[str, object]] = {}
-    for decl_info in collect_axiomized_probed_declarations(paths, candidates=candidate_entries):
-        module_name = str(decl_info["module"])
-        permitted_by_name[str(decl_info["decl_name"])] = {
-            "decl_name": str(decl_info["decl_name"]),
+    for entry in candidate_entries:
+        module_name = str(entry["module"])
+        permitted_by_name[str(entry["decl_name"])] = {
+            "decl_name": str(entry["decl_name"]),
             "module": module_name,
-            "file": str(decl_info["file"]),
-            "statement_hash": str(decl_info["statement_hash"]),
+            "file": str(entry["file"]),
+            "statement_hash": PLACEHOLDER_STATEMENT_HASH,
             "origin": "prior_same_module" if module_name == target_module else "dependency_module",
-            "range": decl_info["range"],
+            "range": entry["range"],
         }
     permitted_axioms = sorted(
         permitted_by_name.values(),
@@ -1353,6 +1120,45 @@ def collect_permitted_axioms(paths, target_info: dict[str, object]) -> tuple[lis
         ),
     )
     return closure, permitted_axioms
+
+
+def dependency_ordered_modules(
+    paths,
+    *,
+    module_closure: list[str],
+    modules: list[str],
+) -> list[str]:
+    allowed = set(modules)
+    ordered: list[str] = []
+    visiting: set[str] = set()
+    visited: set[str] = set()
+
+    def visit(module_name: str) -> None:
+        if module_name not in allowed or module_name in visited:
+            return
+        if module_name in visiting:
+            fail(
+                "prepare 检测到候选模块之间存在循环依赖。",
+                details=[f"模块：`{module_name}`"],
+                hints=[
+                    "Lean 正常 import 图不应出现这种情况，请先检查 `.ilean` 元数据是否损坏。",
+                ],
+            )
+        visiting.add(module_name)
+        metadata = load_ilean_metadata(paths, module_name)
+        for imported in direct_host_imports_from_metadata(paths, metadata):
+            if imported in allowed:
+                visit(imported)
+        visiting.remove(module_name)
+        visited.add(module_name)
+        ordered.append(module_name)
+
+    for module_name in module_closure:
+        if module_name in allowed:
+            visit(module_name)
+    for module_name in sorted(allowed):
+        visit(module_name)
+    return ordered
 
 
 def resolve_mismatch_decl_name(
@@ -1399,6 +1205,8 @@ def parse_temporary_axiom_hash_mismatches(
 def verify_prepared_axiom_hashes(
     paths,
     *,
+    target_module: str,
+    module_closure: list[str],
     target_decl: str,
     permitted_axioms: list[dict[str, object]],
 ) -> None:
@@ -1407,66 +1215,82 @@ def verify_prepared_axiom_hashes(
     grouped: dict[str, list[dict[str, object]]] = defaultdict(list)
     for entry in permitted_axioms:
         grouped[str(entry["module"])].append(entry)
-    module_items = sorted(grouped.items())
-    max_passes = 3
-    for pass_idx in range(max_passes):
-        changed = False
-        for module_name, module_entries in module_items:
-            result = run_command(
-                paths,
-                ["lake", "build", module_name],
-                f"校验 `{module_name}` 中 temporary axioms 的 statement hash",
-                allow_failure=True,
-            )
-            if result.returncode == 0:
-                continue
-            output = "\n".join(part for part in [result.stdout.strip(), result.stderr.strip()] if part)
-            mismatches = parse_temporary_axiom_hash_mismatches(
-                output,
-                module_entries=module_entries,
-            )
-            if not mismatches:
-                fail(
-                    "prepare 阶段校验 temporary axioms 时构建失败。",
-                    details=[
-                        f"模块：`{module_name}`",
-                        f"命令：`lake build {module_name}`",
-                        "输出：\n" + (output or "<空>"),
-                    ],
-                    hints=[
-                        "先检查该模块是否存在与 temporary axioms 无关的编译错误。",
-                    ],
-                )
-            for entry in module_entries:
-                decl_name = str(entry["decl_name"])
-                actual_hash = mismatches.get(decl_name)
-                if actual_hash is None:
-                    continue
-                if str(entry["statement_hash"]) != actual_hash:
-                    entry["statement_hash"] = actual_hash
-                    changed = True
-        if not changed:
-            return
-        write_generated_runtime(
+    build_order = dependency_ordered_modules(
+        paths,
+        module_closure=module_closure,
+        modules=sorted(grouped),
+    )
+    for module_name in build_order:
+        module_entries = grouped[module_name]
+        result = run_command(
             paths,
-            target_decl=target_decl,
-            permitted_axioms=permitted_axioms,
+            ["lake", "build", module_name],
+            f"校验 `{module_name}` 中 temporary axioms 的 statement hash",
+            allow_failure=True,
         )
-    fail(
-        "prepare 无法在有限轮次内稳定 temporary axiom 的 statement hash。",
-        details=[
-            f"已尝试轮次：{max_passes}",
-        ],
-        hints=[
-            "检查相关声明是否存在会随着 prepared session 改变而继续漂移的 header。",
-        ],
+        if result.returncode == 0:
+            continue
+        output = "\n".join(part for part in [result.stdout.strip(), result.stderr.strip()] if part)
+        mismatches = parse_temporary_axiom_hash_mismatches(
+            output,
+            module_entries=module_entries,
+        )
+        if not mismatches:
+            fail(
+                "prepare 阶段校验 temporary axioms 时构建失败。",
+                details=[
+                    f"模块：`{module_name}`",
+                    f"命令：`lake build {module_name}`",
+                    "输出：\n" + (output or "<空>"),
+                ],
+                hints=[
+                    "如果这是 temporary axiom hash 问题，先检查依赖优先的模块顺序是否覆盖到了所有被改写模块。",
+                    "否则说明该模块还存在与 temporary axioms 无关的编译错误。",
+                ],
+            )
+        changed = False
+        for entry in module_entries:
+            decl_name = str(entry["decl_name"])
+            actual_hash = mismatches.get(decl_name)
+            if actual_hash is None:
+                continue
+            if str(entry["statement_hash"]) != actual_hash:
+                entry["statement_hash"] = actual_hash
+                changed = True
+        if not changed:
+            fail(
+                "prepare 无法从当前模块构建输出中回填 temporary axiom hash。",
+                details=[
+                    f"模块：`{module_name}`",
+                    f"命令：`lake build {module_name}`",
+                    "输出：\n" + (output or "<空>"),
+                ],
+                hints=[
+                    "这通常说明构建日志里的 mismatch 并不属于当前模块。",
+                ],
+            )
+        write_generated_permitted_runtime(
+            paths,
+            module_name=module_name,
+            permitted_axioms=module_entries,
+        )
+    run_command(
+        paths,
+        ["lake", "build", target_module],
+        f"完成 prepared session 后重建 `{target_module}`",
     )
 
 
-def read_generated_runtime_text(paths) -> str:
-    if not paths.generated_session_file.exists():
-        return ""
-    return paths.generated_session_file.read_text(encoding="utf-8")
+def read_generated_source_map(paths) -> dict[str, str]:
+    sources: dict[str, str] = {}
+    candidate_paths = [paths.generated_target_file, paths.legacy_generated_session_file]
+    for path in candidate_paths:
+        if path.exists():
+            sources[relative_path_str(paths.project_root, path)] = path.read_text(encoding="utf-8")
+    if paths.generated_permitted_root.exists():
+        for path in sorted(paths.generated_permitted_root.rglob("*.lean")):
+            sources[relative_path_str(paths.project_root, path)] = path.read_text(encoding="utf-8")
+    return sources
 
 
 def extract_session_target(session_payload: dict[str, Any]) -> dict[str, str]:
@@ -1499,6 +1323,7 @@ def extract_session_permitted_axioms(session_payload: dict[str, Any]) -> list[di
             entries.append(
                 {
                     "decl_name": str(item["decl_name"]),
+                    "module": str(item["module"]),
                     "statement_hash": str(item["statement_hash"]),
                 }
             )
@@ -1507,20 +1332,61 @@ def extract_session_permitted_axioms(session_payload: dict[str, Any]) -> list[di
     return entries
 
 
-def expected_runtime_from_session(session_payload: dict[str, Any]) -> str:
+def expected_generated_sources_from_session(paths, session_payload: dict[str, Any]) -> dict[str, str]:
     target = extract_session_target(session_payload)
     permitted_axioms = extract_session_permitted_axioms(session_payload)
-    return generated_runtime_source(
-        target_decl=target["decl_name"],
-        permitted_axioms=permitted_axioms,
+    return {
+        relative_path_str(paths.project_root, path): text
+        for path, text in generated_session_sources(
+            paths,
+            target_decl=target["decl_name"],
+            permitted_axioms=permitted_axioms,
+        ).items()
+    }
+
+
+def reset_generated_sources(paths) -> dict[str, str]:
+    return {
+        relative_path_str(paths.project_root, paths.generated_target_file): generated_session_sources(
+            paths,
+            target_decl=None,
+            permitted_axioms=[],
+        )[paths.generated_target_file]
+    }
+
+
+def generated_source_diff(
+    actual_sources: dict[str, str],
+    expected_sources: dict[str, str],
+) -> tuple[list[str], list[str], list[str]]:
+    missing_files = sorted(set(expected_sources) - set(actual_sources))
+    extra_files = sorted(set(actual_sources) - set(expected_sources))
+    mismatched_files = sorted(
+        relative_file
+        for relative_file in set(actual_sources) & set(expected_sources)
+        if actual_sources[relative_file] != expected_sources[relative_file]
     )
+    return missing_files, extra_files, mismatched_files
+
+
+def managed_import_module_name(line: str) -> str | None:
+    if MANAGED_IMPORT_MARKER not in line:
+        return None
+    import_prefix = line.partition(MANAGED_IMPORT_MARKER)[0].rstrip()
+    match = IMPORT_RE.match(import_prefix)
+    if match is None:
+        return None
+    modules = match.group("mods").split()
+    if len(modules) != 1:
+        return None
+    return modules[0]
 
 
 def scan_managed_markers_in_files(
     paths,
     relative_files: set[str],
-) -> tuple[set[str], dict[str, set[str]]]:
-    import_files: set[str] = set()
+) -> tuple[dict[str, set[str]], dict[str, set[str]]]:
+    managed_imports: dict[str, set[str]] = defaultdict(set)
     attribute_markers: dict[str, set[str]] = defaultdict(set)
     for relative_file in sorted(relative_files):
         path = paths.project_root / relative_file
@@ -1532,34 +1398,37 @@ def scan_managed_markers_in_files(
             continue
         for line in text.splitlines():
             if MANAGED_IMPORT_MARKER in line:
-                import_files.add(relative_file)
+                import_module = managed_import_module_name(line)
+                if import_module is not None:
+                    managed_imports[relative_file].add(import_module)
             if MANAGED_ATTR_PREFIX in line:
                 decl_name = managed_attr_decl_name(line)
                 if decl_name:
                     attribute_markers[relative_file].add(decl_name)
-    return import_files, dict(attribute_markers)
+    return dict(managed_imports), dict(attribute_markers)
 
 
 def inspect_session_state(paths) -> SessionInspection:
     session_exists = paths.session_file.exists()
     session_payload = read_json(paths.session_file) if session_exists else None
-    runtime_text = read_generated_runtime_text(paths)
-    reset_runtime = generated_runtime_source(target_decl=None, permitted_axioms=[])
-    runtime_is_reset = runtime_text == reset_runtime
-    runtime_matches_session = False
-    import_files: set[str] = set()
+    actual_generated_sources = read_generated_source_map(paths)
+    generated_is_reset = actual_generated_sources == reset_generated_sources(paths)
+    generated_matches_session = False
+    managed_imports: dict[str, set[str]] = {}
     attribute_markers: dict[str, set[str]] = {}
     if session_payload is not None:
-        runtime_matches_session = runtime_text == expected_runtime_from_session(session_payload)
+        generated_matches_session = (
+            actual_generated_sources == expected_generated_sources_from_session(paths, session_payload)
+        )
         expected_imports, expected_attrs = expected_markers_from_session(session_payload)
-        tracked_files = expected_imports | set(expected_attrs)
-        import_files, attribute_markers = scan_managed_markers_in_files(paths, tracked_files)
+        tracked_files = set(expected_imports) | set(expected_attrs)
+        managed_imports, attribute_markers = scan_managed_markers_in_files(paths, tracked_files)
     return SessionInspection(
         session_exists=session_exists,
         session_payload=session_payload,
-        runtime_matches_session=runtime_matches_session,
-        runtime_is_reset=runtime_is_reset,
-        import_files=import_files,
+        generated_matches_session=generated_matches_session,
+        generated_is_reset=generated_is_reset,
+        managed_imports=managed_imports,
         attribute_markers=attribute_markers,
     )
 
@@ -1568,22 +1437,33 @@ def ensure_no_stale_workspace_state(paths, inspection: SessionInspection) -> Non
     if inspection.session_exists:
         return
     details: list[str] = []
-    if not inspection.runtime_is_reset:
-        details.append(
-            f"生成 runtime 没有处于重置状态：`{relative_path_str(paths.project_root, paths.generated_session_file)}`"
+    if not inspection.generated_is_reset:
+        actual_generated_sources = read_generated_source_map(paths)
+        reset_sources = reset_generated_sources(paths)
+        missing_files, extra_files, mismatched_files = generated_source_diff(
+            actual_generated_sources,
+            reset_sources,
         )
+        if missing_files:
+            details.append("缺失的 reset generated 文件：\n" + "\n".join(f"- `{file}`" for file in missing_files))
+        if extra_files:
+            details.append("额外残留的 generated 文件：\n" + "\n".join(f"- `{file}`" for file in extra_files))
+        if mismatched_files:
+            details.append("内容与 reset 状态不一致的 generated 文件：\n" + "\n".join(f"- `{file}`" for file in mismatched_files))
     if details:
         fail(
             "没有活动 session 文件，但 workspace 里仍然残留上一次 session 的状态。",
             details=details,
             hints=[
-                "先手动检查 generated runtime 是否应当重置。",
+                "先手动检查 generated target / permitted 文件是否应当重置。",
                 "必要时恢复正确的 `session.json` 后再执行 `cleanup`，或手动整理当前 workspace。",
             ],
         )
 
 
-def expected_markers_from_session(session_payload: dict[str, Any]) -> tuple[set[str], dict[str, set[str]]]:
+def expected_markers_from_session(
+    session_payload: dict[str, Any],
+) -> tuple[dict[str, set[str]], dict[str, set[str]]]:
     try:
         edits = session_payload["cleanup"]["edits"]
     except (KeyError, TypeError):
@@ -1592,15 +1472,16 @@ def expected_markers_from_session(session_payload: dict[str, Any]) -> tuple[set[
     raw_attributes = edits.get("attributes", [])
     if not isinstance(raw_imports, list) or not isinstance(raw_attributes, list):
         fail("活动 session 文件中的 `cleanup.edits` 格式无效。")
-    import_files: set[str] = set()
+    managed_imports: dict[str, set[str]] = defaultdict(set)
     attribute_markers: dict[str, set[str]] = defaultdict(set)
     for item in raw_imports:
         if isinstance(item, dict) and "file" in item:
-            import_files.add(str(item["file"]))
+            module_name = item.get("module", TOOL_TEMPORARY_AXIOM_MODULE)
+            managed_imports[str(item["file"])].add(str(module_name))
     for item in raw_attributes:
         if isinstance(item, dict) and "file" in item and "decl_name" in item:
             attribute_markers[str(item["file"])].add(str(item["decl_name"]))
-    return import_files, dict(attribute_markers)
+    return dict(managed_imports), dict(attribute_markers)
 
 
 def ensure_active_session_consistent(paths, inspection: SessionInspection) -> dict[str, Any]:
@@ -1608,8 +1489,16 @@ def ensure_active_session_consistent(paths, inspection: SessionInspection) -> di
     if session_payload is None:
         fail("内部错误：缺少活动 session payload。")
     expected_imports, expected_attrs = expected_markers_from_session(session_payload)
-    missing_imports = sorted(expected_imports - inspection.import_files)
-    extra_imports = sorted(inspection.import_files - expected_imports)
+    missing_imports: dict[str, set[str]] = {}
+    extra_imports: dict[str, set[str]] = {}
+    all_import_files = set(expected_imports) | set(inspection.managed_imports)
+    for relative_file in sorted(all_import_files):
+        expected = expected_imports.get(relative_file, set())
+        actual = inspection.managed_imports.get(relative_file, set())
+        if expected - actual:
+            missing_imports[relative_file] = expected - actual
+        if actual - expected:
+            extra_imports[relative_file] = actual - expected
     missing_attrs: dict[str, set[str]] = {}
     extra_attrs: dict[str, set[str]] = {}
     all_attr_files = set(expected_attrs) | set(inspection.attribute_markers)
@@ -1623,14 +1512,36 @@ def ensure_active_session_consistent(paths, inspection: SessionInspection) -> di
     details: list[str] = []
     target = extract_session_target(session_payload)
     details.append(f"当前活动 target：`{target['decl_name']}`")
-    if not inspection.runtime_matches_session:
-        details.append(
-            f"`{relative_path_str(paths.project_root, paths.generated_session_file)}` 与活动 session 不一致。"
+    if not inspection.generated_matches_session:
+        actual_generated_sources = read_generated_source_map(paths)
+        expected_generated_sources = expected_generated_sources_from_session(paths, session_payload)
+        missing_files, extra_files, mismatched_files = generated_source_diff(
+            actual_generated_sources,
+            expected_generated_sources,
         )
+        if missing_files:
+            details.append(
+                "缺失的 generated 文件：\n" + "\n".join(f"- `{file}`" for file in missing_files)
+            )
+        if extra_files:
+            details.append(
+                "额外的 generated 文件：\n" + "\n".join(f"- `{file}`" for file in extra_files)
+            )
+        if mismatched_files:
+            details.append(
+                "内容与活动 session 不一致的 generated 文件：\n"
+                + "\n".join(f"- `{file}`" for file in mismatched_files)
+            )
     if missing_imports:
-        details.append("缺失的 managed import：\n" + "\n".join(f"- `{file}`" for file in missing_imports))
+        details.append(
+            "缺失的 managed import：\n"
+            + "\n".join(f"- {line}" for line in summarize_managed_imports(missing_imports))
+        )
     if extra_imports:
-        details.append("额外的 managed import：\n" + "\n".join(f"- `{file}`" for file in extra_imports))
+        details.append(
+            "额外的 managed import：\n"
+            + "\n".join(f"- {line}" for line in summarize_managed_imports(extra_imports))
+        )
     if missing_attrs:
         details.append(
             "缺失的 managed attribute：\n" + "\n".join(
@@ -1649,7 +1560,7 @@ def ensure_active_session_consistent(paths, inspection: SessionInspection) -> di
             details=details,
             hints=[
                 "优先尝试运行 `python3 scripts/temporary_axiom_session.py cleanup` 回滚 managed 修改。",
-                "如果源码已经被手动改动，请先检查 `session.json`、generated runtime 和相关模块文件。",
+                "如果源码已经被手动改动，请先检查 `session.json`、generated target / permitted 文件和相关模块文件。",
             ],
         )
     return session_payload
@@ -1704,19 +1615,21 @@ def compute_import_insertion_index(lines: list[str]) -> int:
     return 0
 
 
-def has_tool_import(lines: list[str]) -> bool:
+def has_import_module(lines: list[str], module_name: str) -> bool:
     for line in lines:
-        stripped = line.strip()
-        if stripped.startswith(f"import {TOOL_TEMPORARY_AXIOM_MODULE}"):
+        match = IMPORT_RE.match(line)
+        if match is None:
+            continue
+        if module_name in match.group("mods").split():
             return True
     return False
 
 
-def add_managed_import(lines: list[str]) -> bool:
-    if has_tool_import(lines):
+def add_managed_import(lines: list[str], *, import_module: str) -> bool:
+    if has_import_module(lines, import_module):
         return False
     insert_idx = compute_import_insertion_index(lines)
-    lines.insert(insert_idx, f"import {TOOL_TEMPORARY_AXIOM_MODULE} {MANAGED_IMPORT_MARKER}")
+    lines.insert(insert_idx, f"import {import_module} {MANAGED_IMPORT_MARKER}")
     return True
 
 
@@ -1955,13 +1868,23 @@ def apply_prepare_edits(
             originals[path] = original_text
             lines, _ = normalize_managed_lines(original_text.splitlines())
             normalized_text = "\n".join(lines) + "\n"
+            host_modules = {str(entry["module"]) for entry in file_entries}
+            if len(host_modules) != 1:
+                fail(
+                    "内部错误：同一个源码文件关联到了多个定义模块。",
+                    details=[
+                        f"文件：`{relative_file}`",
+                        "模块：\n" + "\n".join(f"- {module_name}" for module_name in sorted(host_modules)),
+                    ],
+                )
+            import_module = generated_permitted_runtime_module_name(next(iter(host_modules)))
             inserted_decls = add_managed_attributes(
                 text=normalized_text,
                 lines=lines,
                 file_entries=file_entries,
             )
-            if file_entries and add_managed_import(lines):
-                edits["imports"].append({"file": relative_file})
+            if file_entries and add_managed_import(lines, import_module=import_module):
+                edits["imports"].append({"file": relative_file, "module": import_module})
             for attr_edit in inserted_decls:
                 edits["attributes"].append(
                     {
@@ -2076,7 +1999,7 @@ def prepare_session(args: argparse.Namespace, paths) -> None:
                 requested_hash=str(requested_target_info["statement_hash"]),
                 session_payload=session_payload,
             )
-        if not inspection.runtime_is_reset:
+        if not inspection.generated_is_reset:
             reset_generated_runtime(paths)
 
         candidate_modules: list[str] | None = None
@@ -2162,14 +2085,16 @@ def prepare_session(args: argparse.Namespace, paths) -> None:
             raise
         try:
             if permitted_axioms:
-                print("Verifying temporary axiom hashes in prepared modules...", flush=True)
+                print("Resolving temporary axiom hashes by rebuilding affected modules...", flush=True)
             verify_prepared_axiom_hashes(
                 paths,
+                target_module=str(target_info["module"]),
+                module_closure=module_closure,
                 target_decl=str(target_info["decl_name"]),
                 permitted_axioms=permitted_axioms,
             )
             session_payload = {
-                "schema_version": 2,
+                "schema_version": 3,
                 "base_commit": base_commit,
                 "freeze": {
                     "target": {
