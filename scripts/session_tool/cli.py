@@ -33,6 +33,8 @@ from .lean_ops import (
     module_artifact_path,
     probe_named_declarations_with_imports,
     reset_generated_runtime,
+    run_command,
+    run_lean_source,
     try_git_head,
     try_probe_decl_in_module,
     write_generated_runtime,
@@ -42,6 +44,12 @@ from .lean_ops import (
 SORRY_TOKEN_RE = re.compile(r"(?<![A-Za-z0-9_'])sorry(?![A-Za-z0-9_'])")
 LEAN_IDENT_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_']*")
 THEOREM_TOKEN_RE = re.compile(r"(?<![A-Za-z0-9_'])theorem(?![A-Za-z0-9_'])")
+TEMP_AXIOM_HASH_MISMATCH_RE = re.compile(
+    r"Invalid @\[temporary_axiom\] target (?P<decl>[^\n]+)\n\n"
+    r"The frozen prepared-session entry does not match the elaborated statement\.\n\n"
+    r"Expected hash: (?P<expected>\d+)\n\n"
+    r"Actual hash:\s+(?P<actual>\d+)"
+)
 INLINE_MODULE_LIST_LIMIT = 10
 INLINE_PERMITTED_AXIOM_LIMIT = 12
 DECL_MODIFIER_TOKENS = {
@@ -54,6 +62,79 @@ DECL_MODIFIER_TOKENS = {
     "local",
     "scoped",
 }
+
+AXIOM_PROBE_HELPER_SOURCE = """open Lean Elab Command Term
+
+private meta def temporaryAxiomProbeJson
+    (declName : Name)
+    (moduleName : Name)
+    (statementHash : UInt64) : Json :=
+  Json.mkObj [
+    ("decl_name", Json.str <| toString declName),
+    ("module", Json.str <| toString moduleName),
+    ("statement_hash", Json.str <| toString statementHash.toNat)
+  ]
+
+private meta def isSupportedTemporaryAxiomProbeConstInfo (constInfo : ConstantInfo) : Bool :=
+  match constInfo with
+  | .thmInfo _ => true
+  | .opaqueInfo _ => true
+  | .axiomInfo _ => true
+  | _ => false
+
+syntax (name := Parser.Attr.temporary_axiom) "temporary_axiom" : attr
+
+builtin_initialize registerBuiltinAttribute {
+    name := `temporary_axiom
+    descr := "temporary axiom probe attribute"
+    applicationTime := AttributeApplicationTime.afterTypeChecking
+    add := fun _declName _stx _kind => pure ()
+    erase := fun _declName => pure ()
+  }
+
+private meta def isTemporaryAxiomAttr (attrInstance : Syntax) : Bool :=
+  if attrInstance.getKind != ``Parser.Term.attrInstance then
+    false
+  else
+    let attr := attrInstance[1]
+    attr.getKind == ``Parser.Attr.temporary_axiom ||
+      (attr.getKind == ``Parser.Attr.simple &&
+        attr[0].getId.eraseMacroScopes == `temporary_axiom &&
+        attr[1].isNone &&
+        attr[2].isNone)
+
+private meta def hasTemporaryAxiomAttr (modifiers : Syntax) : Bool :=
+  if modifiers.getKind != ``Parser.Command.declModifiers then
+    false
+  else
+    let attrsOpt := modifiers[1]
+    if attrsOpt.isNone then
+      false
+    else
+      let attrs := attrsOpt[0][1].getSepArgs
+      attrs.any isTemporaryAxiomAttr
+
+macro_rules
+  (kind := Lean.Parser.Command.declaration)
+  | `($modifiers:declModifiers theorem $declId:declId $declSig:declSig $_:declVal) => do
+      if !hasTemporaryAxiomAttr modifiers then
+        Macro.throwUnsupported
+      `(command| $modifiers:declModifiers axiom $declId:declId $declSig:declSig)
+
+elab "#print_axiomized_decl_probe " quotedName:term " in " quotedModule:term : command => do
+  let declName ← liftTermElabM do
+    unsafe Term.evalTerm Name (mkConst ``Name) quotedName
+  let moduleName ← liftTermElabM do
+    unsafe Term.evalTerm Name (mkConst ``Name) quotedModule
+  let env ← getEnv
+  let some constInfo := env.find? declName | pure ()
+  if isSupportedTemporaryAxiomProbeConstInfo constInfo then
+    liftIO <| IO.println <|
+      (temporaryAxiomProbeJson
+        declName
+        moduleName
+        (TemporaryAxiomTool.statementHashOfConstInfo constInfo)).compress
+"""
 
 
 @dataclass(frozen=True)
@@ -923,7 +1004,115 @@ def collect_probed_declarations(
                 relative_file=str(entry["file"]),
                 range_info=entry["range"],
             )
+        )
+    return normalized
+
+
+def build_axiom_probe_source(
+    *,
+    prefix_source: str,
+    file_entries: list[dict[str, object]],
+    decl_names: list[str],
+) -> str:
+    lines = prefix_source.splitlines()
+    add_managed_attributes(
+        text=prefix_source,
+        lines=lines,
+        file_entries=file_entries,
     )
+    insert_idx = compute_import_insertion_index(lines)
+    source_lines: list[str] = []
+    source_lines.extend(lines[:insert_idx])
+    source_lines.append("public import Lean.Attributes")
+    source_lines.append("public meta import TemporaryAxiomTool.StatementHash")
+    source_lines.append("public meta import Lean.Attributes")
+    source_lines.append("public meta import Lean.Elab.Command")
+    source_lines.append("public meta import Lean.Elab.Term")
+    source_lines.append("")
+    source_lines.extend(AXIOM_PROBE_HELPER_SOURCE.splitlines())
+    source_lines.append("")
+    source_lines.extend(lines[insert_idx:])
+    source_lines.append("")
+    for entry in file_entries:
+        source_lines.append(
+            f"#print_axiomized_decl_probe `{entry['decl_name']} in `{entry['module']}"
+        )
+    return "\n".join(source_lines) + "\n"
+
+
+def collect_axiomized_probed_declarations(
+    paths,
+    *,
+    candidates: list[dict[str, object]],
+) -> list[dict[str, object]]:
+    if not candidates:
+        return []
+    grouped: dict[str, list[dict[str, object]]] = defaultdict(list)
+    for entry in candidates:
+        grouped[str(entry["module"])].append(entry)
+    normalized: list[dict[str, object]] = []
+    for module_name, module_entries in sorted(grouped.items()):
+        source_text = normalized_module_source_text(paths, module_name)
+        line_starts = normalized_module_source_line_starts(paths, module_name)
+        replay_end = max(
+            offset_for_line_column(
+                source_text,
+                line_starts,
+                int(entry["range"]["end_line"]),
+                int(entry["range"]["end_column"]),
+            )
+            for entry in module_entries
+        )
+        prefix_source = source_text[:replay_end]
+        decl_names = [str(entry["decl_name"]) for entry in module_entries]
+        result, payloads = run_lean_source(
+            paths,
+            source=build_axiom_probe_source(
+                prefix_source=prefix_source,
+                file_entries=module_entries,
+                decl_names=decl_names,
+            ),
+            description=f"按 axiom 语义探测模块 `{module_name}` 中的 permitted declarations",
+            allow_failure=True,
+        )
+        payload_by_name = {str(payload["decl_name"]): payload for payload in payloads}
+        missing_decl_names = [
+            decl_name for decl_name in decl_names if decl_name not in payload_by_name
+        ]
+        if missing_decl_names:
+            preview = missing_decl_names[:10]
+            details = [
+                f"模块：`{module_name}`",
+                f"缺失数量：{len(missing_decl_names)}",
+                "缺失声明：\n" + "\n".join(f"- {decl_name}" for decl_name in preview),
+            ]
+            if result.returncode != 0:
+                output = "\n".join(
+                    part for part in [result.stdout.strip(), result.stderr.strip()] if part
+                )
+                if output:
+                    details.append("临时 probe 输出：\n" + output)
+            if len(missing_decl_names) > len(preview):
+                details.append(f"其余缺失条目：{len(missing_decl_names) - len(preview)} 个")
+            fail(
+                "axiom probe 没有返回全部候选声明。",
+                details=details,
+                hints=[
+                    "这通常说明临时回放的源码前缀没有成功重建所需上下文。",
+                    "先检查对应模块里是否存在非常规 theorem 头语法，或近期是否刚改过源码但未重建。",
+                ],
+            )
+        for entry in module_entries:
+            decl_name = str(entry["decl_name"])
+            payload = payload_by_name[decl_name]
+            normalized.append(
+                normalize_probed_decl(
+                    payload,
+                    module_name=str(entry["module"]),
+                    relative_file=str(entry["file"]),
+                    range_info=entry["range"],
+                )
+            )
     return normalized
 
 
@@ -1144,7 +1333,7 @@ def collect_permitted_axioms(paths, target_info: dict[str, object]) -> tuple[lis
                 continue
             candidate_entries.append(entry)
     permitted_by_name: dict[str, dict[str, object]] = {}
-    for decl_info in collect_probed_declarations(paths, imports=closure, candidates=candidate_entries):
+    for decl_info in collect_axiomized_probed_declarations(paths, candidates=candidate_entries):
         module_name = str(decl_info["module"])
         permitted_by_name[str(decl_info["decl_name"])] = {
             "decl_name": str(decl_info["decl_name"]),
@@ -1164,6 +1353,114 @@ def collect_permitted_axioms(paths, target_info: dict[str, object]) -> tuple[lis
         ),
     )
     return closure, permitted_axioms
+
+
+def resolve_mismatch_decl_name(
+    module_entries: list[dict[str, object]],
+    raw_decl_name: str,
+) -> str | None:
+    exact_matches = [
+        str(entry["decl_name"]) for entry in module_entries if str(entry["decl_name"]) == raw_decl_name
+    ]
+    if len(exact_matches) == 1:
+        return exact_matches[0]
+    short_matches = [
+        str(entry["decl_name"])
+        for entry in module_entries
+        if short_decl_name(str(entry["decl_name"])) == raw_decl_name
+    ]
+    if len(short_matches) == 1:
+        return short_matches[0]
+    suffix_matches = [
+        str(entry["decl_name"])
+        for entry in module_entries
+        if str(entry["decl_name"]).endswith("." + raw_decl_name)
+    ]
+    if len(suffix_matches) == 1:
+        return suffix_matches[0]
+    return None
+
+
+def parse_temporary_axiom_hash_mismatches(
+    output: str,
+    *,
+    module_entries: list[dict[str, object]],
+) -> dict[str, str]:
+    resolved: dict[str, str] = {}
+    for match in TEMP_AXIOM_HASH_MISMATCH_RE.finditer(output):
+        raw_decl_name = match.group("decl").strip()
+        full_decl_name = resolve_mismatch_decl_name(module_entries, raw_decl_name)
+        if full_decl_name is None:
+            continue
+        resolved[full_decl_name] = match.group("actual")
+    return resolved
+
+
+def verify_prepared_axiom_hashes(
+    paths,
+    *,
+    target_decl: str,
+    permitted_axioms: list[dict[str, object]],
+) -> None:
+    if not permitted_axioms:
+        return
+    grouped: dict[str, list[dict[str, object]]] = defaultdict(list)
+    for entry in permitted_axioms:
+        grouped[str(entry["module"])].append(entry)
+    module_items = sorted(grouped.items())
+    max_passes = 3
+    for pass_idx in range(max_passes):
+        changed = False
+        for module_name, module_entries in module_items:
+            result = run_command(
+                paths,
+                ["lake", "build", module_name],
+                f"校验 `{module_name}` 中 temporary axioms 的 statement hash",
+                allow_failure=True,
+            )
+            if result.returncode == 0:
+                continue
+            output = "\n".join(part for part in [result.stdout.strip(), result.stderr.strip()] if part)
+            mismatches = parse_temporary_axiom_hash_mismatches(
+                output,
+                module_entries=module_entries,
+            )
+            if not mismatches:
+                fail(
+                    "prepare 阶段校验 temporary axioms 时构建失败。",
+                    details=[
+                        f"模块：`{module_name}`",
+                        f"命令：`lake build {module_name}`",
+                        "输出：\n" + (output or "<空>"),
+                    ],
+                    hints=[
+                        "先检查该模块是否存在与 temporary axioms 无关的编译错误。",
+                    ],
+                )
+            for entry in module_entries:
+                decl_name = str(entry["decl_name"])
+                actual_hash = mismatches.get(decl_name)
+                if actual_hash is None:
+                    continue
+                if str(entry["statement_hash"]) != actual_hash:
+                    entry["statement_hash"] = actual_hash
+                    changed = True
+        if not changed:
+            return
+        write_generated_runtime(
+            paths,
+            target_decl=target_decl,
+            permitted_axioms=permitted_axioms,
+        )
+    fail(
+        "prepare 无法在有限轮次内稳定 temporary axiom 的 statement hash。",
+        details=[
+            f"已尝试轮次：{max_passes}",
+        ],
+        hints=[
+            "检查相关声明是否存在会随着 prepared session 改变而继续漂移的 header。",
+        ],
+    )
 
 
 def read_generated_runtime_text(paths) -> str:
@@ -1864,6 +2161,13 @@ def prepare_session(args: argparse.Namespace, paths) -> None:
             reset_generated_runtime(paths)
             raise
         try:
+            if permitted_axioms:
+                print("Verifying temporary axiom hashes in prepared modules...", flush=True)
+            verify_prepared_axiom_hashes(
+                paths,
+                target_decl=str(target_info["decl_name"]),
+                permitted_axioms=permitted_axioms,
+            )
             session_payload = {
                 "schema_version": 2,
                 "base_commit": base_commit,

@@ -257,20 +257,13 @@ def ensure_probe_tool_ready(paths) -> None:
             return
 
 
-def run_lean_probe(
+def run_lean_source(
     paths,
     *,
-    imports: list[str],
-    command_lines: list[str],
+    source: str,
     description: str,
     allow_failure: bool = False,
 ) -> tuple[subprocess.CompletedProcess[str], list[dict[str, object]]]:
-    lines = ["module", f"import {TOOL_PREPARED_SESSION_MODULE}"]
-    for module_name in imports:
-        lines.append(f"import {module_name}")
-    lines.append("")
-    lines.extend(command_lines)
-    source = "\n".join(lines) + "\n"
     with tempfile.NamedTemporaryFile(
         "w",
         suffix=".lean",
@@ -296,6 +289,28 @@ def run_lean_probe(
         if stripped.startswith("{") and stripped.endswith("}"):
             payloads.append(json.loads(stripped))
     return result, payloads
+
+
+def run_lean_probe(
+    paths,
+    *,
+    imports: list[str],
+    command_lines: list[str],
+    description: str,
+    allow_failure: bool = False,
+) -> tuple[subprocess.CompletedProcess[str], list[dict[str, object]]]:
+    lines = ["module", f"import {TOOL_PREPARED_SESSION_MODULE}"]
+    for module_name in imports:
+        lines.append(f"import {module_name}")
+    lines.append("")
+    lines.extend(command_lines)
+    source = "\n".join(lines) + "\n"
+    return run_lean_source(
+        paths,
+        source=source,
+        description=description,
+        allow_failure=allow_failure,
+    )
 
 
 def lean_name_literal(name: str) -> str:
