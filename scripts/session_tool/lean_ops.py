@@ -76,8 +76,150 @@ def build_module(paths, module_name: str) -> None:
     run_command(paths, ["lake", "build", module_name], f"构建 `{module_name}`")
 
 
+TEXT_HASH_RUNNER_SOURCE = """import Lake
+open System
+
+def main (args : List String) : IO UInt32 := do
+  for arg in args do
+    let hash <- Lake.computeTextFileHash (FilePath.mk arg)
+    IO.println s!\"{arg}\\t{hash}\"
+  return 0
+"""
+
+
 def module_artifact_path(paths, module_name: str, suffix: str) -> Path:
     return paths.lean_build_lib_root / module_name_to_relative_path(module_name).with_suffix(suffix)
+
+
+def trace_artifact_path(paths, module_name: str) -> Path:
+    return module_artifact_path(paths, module_name, ".trace")
+
+
+def trace_source_hash(trace_path: Path, *, source_path: Path, relative_source_suffix: str) -> str | None:
+    try:
+        trace_data = json.loads(trace_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    inputs = trace_data.get("inputs", [])
+    if not isinstance(inputs, list):
+        return None
+    resolved_source_path = source_path.resolve()
+    for item in inputs:
+        if not isinstance(item, list) or len(item) < 2:
+            continue
+        caption = str(item[0])
+        value = item[1]
+        if not isinstance(value, str):
+            continue
+        caption_matches = False
+        try:
+            caption_matches = Path(caption).resolve() == resolved_source_path
+        except OSError:
+            caption_matches = False
+        if not caption_matches:
+            caption_matches = caption.replace("\\", "/").endswith(relative_source_suffix)
+        if not caption_matches:
+            continue
+        normalized = value.strip().lower()
+        if len(normalized) == 16 and all(ch in "0123456789abcdef" for ch in normalized):
+            return normalized
+    return None
+
+
+def compute_text_file_hashes(paths, file_paths: list[Path]) -> dict[Path, str]:
+    resolved_paths: list[Path] = []
+    seen: set[Path] = set()
+    for path in file_paths:
+        resolved = path.resolve()
+        if resolved in seen:
+            continue
+        seen.add(resolved)
+        resolved_paths.append(resolved)
+    if not resolved_paths:
+        return {}
+    with tempfile.NamedTemporaryFile(
+        "w",
+        suffix=".lean",
+        prefix="TemporaryAxiomToolHash_",
+        dir=paths.project_root,
+        encoding="utf-8",
+        delete=False,
+    ) as handle:
+        handle.write(TEXT_HASH_RUNNER_SOURCE)
+        temp_path = Path(handle.name)
+    try:
+        result = run_command(
+            paths,
+            ["lake", "env", "lean", "--run", str(temp_path), *[str(path) for path in resolved_paths]],
+            "计算源码文本哈希",
+        )
+    finally:
+        temp_path.unlink(missing_ok=True)
+    hashes: dict[Path, str] = {}
+    for line in result.stdout.splitlines():
+        raw_path, sep, raw_hash = line.partition("\t")
+        if not sep:
+            continue
+        hashes[Path(raw_path).resolve()] = raw_hash.strip().lower()
+    missing_paths = [str(path) for path in resolved_paths if path not in hashes]
+    if missing_paths:
+        preview = missing_paths[:10]
+        details = [
+            f"缺失数量：{len(missing_paths)}",
+            "缺失文件：\n" + "\n".join(f"- `{path}`" for path in preview),
+        ]
+        if len(missing_paths) > len(preview):
+            details.append(f"其余缺失条目：{len(missing_paths) - len(preview)} 个")
+        fail(
+            "Lean 文本哈希工具没有返回全部请求文件。",
+            details=details,
+        )
+    return hashes
+
+
+def compute_text_hashes_for_texts(paths, texts_by_path: dict[Path, str]) -> dict[Path, str]:
+    resolved_items: list[tuple[Path, str]] = []
+    seen: set[Path] = set()
+    for path, text in texts_by_path.items():
+        resolved = path.resolve()
+        if resolved in seen:
+            continue
+        seen.add(resolved)
+        resolved_items.append((resolved, text))
+    if not resolved_items:
+        return {}
+    with tempfile.TemporaryDirectory(
+        prefix="TemporaryAxiomToolNormalizedHash_",
+        dir=paths.project_root,
+    ) as temp_dir_name:
+        temp_dir = Path(temp_dir_name)
+        temp_paths: list[Path] = []
+        original_by_temp: dict[Path, Path] = {}
+        for idx, (original_path, text) in enumerate(resolved_items):
+            temp_path = temp_dir / f"normalized_{idx}.lean"
+            temp_path.write_text(text, encoding="utf-8")
+            temp_paths.append(temp_path)
+            original_by_temp[temp_path.resolve()] = original_path
+        raw_hashes = compute_text_file_hashes(paths, temp_paths)
+    hashes: dict[Path, str] = {}
+    for temp_path, hash_value in raw_hashes.items():
+        original_path = original_by_temp.get(temp_path.resolve())
+        if original_path is not None:
+            hashes[original_path] = hash_value
+    missing_paths = [str(path) for path, _ in resolved_items if path not in hashes]
+    if missing_paths:
+        preview = missing_paths[:10]
+        details = [
+            f"缺失数量：{len(missing_paths)}",
+            "缺失文件：\n" + "\n".join(f"- `{path}`" for path in preview),
+        ]
+        if len(missing_paths) > len(preview):
+            details.append(f"其余缺失条目：{len(missing_paths) - len(preview)} 个")
+        fail(
+            "Lean 文本哈希工具没有返回全部规范化源码。",
+            details=details,
+        )
+    return hashes
 
 
 def ensure_probe_tool_ready(paths) -> None:
@@ -91,15 +233,26 @@ def ensure_probe_tool_ready(paths) -> None:
         paths.project_root / TOOL_NAMESPACE / "PreparedSession" / "Types.lean",
         paths.project_root / TOOL_NAMESPACE / "PreparedSession.lean",
     ]
-    for module_name, source_path in zip(required_modules, required_sources, strict=True):
+    for module_name in required_modules:
         olean_path = module_artifact_path(paths, module_name, ".olean")
         ilean_path = module_artifact_path(paths, module_name, ".ilean")
-        if not olean_path.exists() or not ilean_path.exists():
+        trace_path = trace_artifact_path(paths, module_name)
+        if not olean_path.exists() or not ilean_path.exists() or not trace_path.exists():
             build_tool(paths)
             return
-        source_mtime = source_path.stat().st_mtime_ns
-        artifact_mtime = min(olean_path.stat().st_mtime_ns, ilean_path.stat().st_mtime_ns)
-        if source_mtime > artifact_mtime:
+    current_hashes = compute_text_file_hashes(paths, required_sources)
+    for module_name, source_path in zip(required_modules, required_sources, strict=True):
+        trace_path = trace_artifact_path(paths, module_name)
+        recorded_hash = trace_source_hash(
+            trace_path,
+            source_path=source_path,
+            relative_source_suffix=source_path.relative_to(paths.project_root).as_posix(),
+        )
+        if recorded_hash is None:
+            build_tool(paths)
+            return
+        current_hash = current_hashes.get(source_path.resolve())
+        if current_hash != recorded_hash:
             build_tool(paths)
             return
 

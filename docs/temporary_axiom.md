@@ -54,6 +54,7 @@
 python3 scripts/temporary_axiom_session.py prepare --target MyProj.Mod:goal
 python3 scripts/temporary_axiom_session.py prepare --target MyProj.Mod:My.Namespace.goal
 python3 scripts/temporary_axiom_session.py prepare --target MyProj.Mod.goal
+python3 scripts/temporary_axiom_session.py prepare --target MyProj.Mod:goal --auto-build
 python3 scripts/temporary_axiom_session.py cleanup
 ```
 
@@ -137,7 +138,7 @@ python3 scripts/temporary_axiom_session.py cleanup
 - `prior_same_module`
   target 同模块且位于 target 之前。
 - `dependency_module`
-  target 依赖模块中的显式 `sorry` 声明。
+  target 依赖模块中的显式 `sorry` theorem 声明。
 
 `temporary_axiom_tool_session_report.txt` 的语义：
 
@@ -152,28 +153,31 @@ python3 scripts/temporary_axiom_session.py cleanup
   - `<module>:<decl>`
   - `<fully-qualified-decl>`
 - `--base-commit <sha>` 可选；默认取当前 `HEAD`
+- `--auto-build` 可选；显式允许 `prepare` 在发现模块产物缺失或与当前源码不同步时先补构建
 
 流程：
 
 1. 解析 `--target`：
    - 若是 `<module>:<decl>`，模块部分总是视为定义模块；声明部分若不含 `.`，则按“模块内短名”定向解析唯一匹配的声明，若含 `.`，则按完整声明名处理。
    - 若是 `<fully-qualified-decl>`，只按声明名前缀尝试有限个候选模块，不做仓库扫描。
-2. 获取 `prepare.lock`，拒绝并发的第二个 `prepare`。
-3. 读取 target 模块 `.ilean` 的 `directImports`，计算项目内 module closure。
-4. 对 closure 中的每个模块读取 `.ilean` 的 `decls`。
-5. 只在 declaration 自己的源码 range 内检查是否显式出现 `sorry`。
-6. 对目标声明和候选 declaration 做轻量 range 校验：`.ilean` range 切出的源码片段必须仍然对应到声明名本身。
-7. 对命中的 declaration 做 Lean probe，读取 statement hash。
-8. 写出 `Generated.lean` 与 `session.json`。
-9. 写出 `temporary_axiom_tool_session_report.txt`。
-10. 在源码中插入 managed import 和 managed `@[temporary_axiom]`。
-11. 立即用 `session.json`、generated runtime 和本次 edit log 做一次本地一致性自检。
-12. 删除 `prepare.lock`。
+2. 如果当前没有活动 session，而 generated runtime 还停留在旧 session 状态，则先重置 runtime。
+3. 尽早检查目标模块闭包是否就绪；preflight 会把旧 tool-managed import / attr 残留视作不存在。默认直接报错，只有显式给出 `--auto-build` 时才会调用 `lake build <root-module>` 补构建。
+4. 获取 `prepare.lock`，拒绝并发的第二个 `prepare`。
+5. 读取 target 模块 `.ilean` 的 `directImports`，计算项目内 module closure。
+6. 先做模块级预筛：只继续扫描源码里可能同时出现 `theorem` 与显式 `sorry` 的模块；这一步也会忽略旧 tool-managed 残留。
+7. 对保留下来的模块读取 `.ilean` 的 `decls`。
+8. 只对源码头部是 `theorem` 的声明，在 declaration 自己的源码 range 内检查是否显式出现 `sorry`。
+9. 对目标声明和命中的 declaration 做 Lean probe，读取 statement hash。
+10. 写出 `Generated.lean` 与 `session.json`。
+11. 写出 `temporary_axiom_tool_session_report.txt`。
+12. 只在本次确实需要打标记的源码文件里插入 managed import 和独立的 managed `@[temporary_axiom]` 行；不会原地改写用户已有的属性行。如果声明头里本来就有 `temporary_axiom`，则直接复用，不重复插入。
+13. 立即用 `session.json`、generated runtime 和本次 edit log 做一次本地一致性自检。
+14. 删除 `prepare.lock`。
 
 当前 permitted 集合只包含两类声明：
 
-- target 同模块且位于 target 之前的显式 `sorry` 声明
-- target 依赖模块中的显式 `sorry` 声明
+- target 同模块且位于 target 之前的显式 `sorry` theorem 声明
+- target 依赖模块中的显式 `sorry` theorem 声明
 
 这里之所以要改源码，是因为运行时检查发生在 Lean elaboration 里：只有 import 了 `TemporaryAxiomTool.TemporaryAxiom`，并且真实给声明加上 `@[temporary_axiom]`，这些声明才会在当前 attempt 中按“受检查的临时公理”工作。
 
@@ -212,10 +216,16 @@ python3 scripts/temporary_axiom_session.py cleanup
 5. 删除 `temporary_axiom_tool_session_report.txt`
 6. 尝试移除空的 `.temporary_axiom_session/`
 
+如果上一次中断只留下了 tool-managed 残留，而活动 session 文件已经不存在，下一次 `prepare` 也会在 preflight 和扫描阶段忽略这些残留；只有这次实际要编辑的文件才会被重新写回，不要求用户先手动返工。
+
 ## 8. 实现边界
 
 - `.ilean` 提供 declaration range 与 import closure
-- 源码扫描只负责显式 `sorry` 判定
+- `prepare` 默认不隐式长时间补构建；以下情况会尽早报错，只有 `--auto-build` 才会补构建：
+  - 缺少 `.ilean` / `.olean` / `.trace`
+  - 当前源码 import 头与 `.ilean` 记录不一致
+  - 当前源码文本哈希与 Lake `.trace` 记录不一致
+- 源码扫描只负责“源码头是 `theorem` 且正文含显式 `sorry`”的判定，并先按模块做轻量预筛
 - Lean probe 只负责 statement hash
 - 不直接解析 `.olean` 二进制文件
 

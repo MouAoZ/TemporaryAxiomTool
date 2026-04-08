@@ -26,6 +26,8 @@ from .common import (
 )
 from .lean_ops import (
     build_module,
+    compute_text_file_hashes,
+    compute_text_hashes_for_texts,
     ensure_probe_tool_ready,
     generated_runtime_source,
     module_artifact_path,
@@ -38,8 +40,20 @@ from .lean_ops import (
 
 
 SORRY_TOKEN_RE = re.compile(r"(?<![A-Za-z0-9_'])sorry(?![A-Za-z0-9_'])")
+LEAN_IDENT_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_']*")
+THEOREM_TOKEN_RE = re.compile(r"(?<![A-Za-z0-9_'])theorem(?![A-Za-z0-9_'])")
 INLINE_MODULE_LIST_LIMIT = 10
 INLINE_PERMITTED_AXIOM_LIMIT = 12
+DECL_MODIFIER_TOKENS = {
+    "private",
+    "protected",
+    "public",
+    "noncomputable",
+    "unsafe",
+    "partial",
+    "local",
+    "scoped",
+}
 
 
 @dataclass(frozen=True)
@@ -57,6 +71,12 @@ class TargetSpec:
     module_name: str | None
     decl_name: str
     decl_is_short_name: bool
+
+
+@dataclass(frozen=True)
+class ArtifactIssue:
+    module_name: str
+    detail: str
 
 
 def relative_path_str(project_root: Path, path: Path) -> str:
@@ -292,6 +312,33 @@ def olean_path_for_module(paths, module_name: str) -> Path:
     return module_artifact_path(paths, module_name, ".olean")
 
 
+def trace_path_for_module(paths, module_name: str) -> Path:
+    return module_artifact_path(paths, module_name, ".trace")
+
+
+@lru_cache(maxsize=None)
+def module_source_text(paths, module_name: str) -> str:
+    path = module_name_to_path(paths.project_root, module_name)
+    return path.read_text(encoding="utf-8")
+
+
+@lru_cache(maxsize=None)
+def normalized_module_source_text(paths, module_name: str) -> str:
+    normalized_text, _ = normalize_managed_text(module_source_text(paths, module_name))
+    return normalized_text
+
+
+@lru_cache(maxsize=None)
+def normalized_module_source_line_starts(paths, module_name: str) -> list[int]:
+    return build_line_starts(normalized_module_source_text(paths, module_name))
+
+
+@lru_cache(maxsize=None)
+def module_relative_file(paths, module_name: str) -> str:
+    path = module_name_to_path(paths.project_root, module_name)
+    return relative_path_str(paths.project_root, path)
+
+
 def clear_module_metadata_caches() -> None:
     load_ilean_metadata.cache_clear()
     module_decl_entries_from_ilean.cache_clear()
@@ -308,78 +355,300 @@ def direct_host_imports_from_metadata(paths, metadata: dict[str, Any]) -> list[s
     return imports
 
 
-def direct_host_imports_from_source(paths, module_name: str) -> list[str]:
+@lru_cache(maxsize=None)
+def direct_host_imports_from_source(paths, module_name: str) -> tuple[str, ...]:
     path = module_name_to_path(paths.project_root, module_name)
-    text = path.read_text(encoding="utf-8")
     imports: list[str] = []
     in_block_comment = False
-    for line in text.splitlines():
-        stripped = line.strip()
-        if in_block_comment:
-            if "-/" in stripped:
-                in_block_comment = False
-            continue
-        if not stripped:
-            continue
-        if stripped.startswith("/-"):
-            if "-/" not in stripped:
-                in_block_comment = True
-            continue
-        if stripped.startswith("--"):
-            continue
-        if stripped == "module":
-            continue
-        match = IMPORT_RE.match(line)
-        if match is None:
-            break
-        for imported in match.group("mods").split():
-            if is_host_project_module(paths.project_root, imported) and imported not in imports:
-                imports.append(imported)
-    return imports
+    with path.open("r", encoding="utf-8") as handle:
+        for raw_line in handle:
+            line = raw_line.rstrip("\n")
+            stripped = line.strip()
+            if in_block_comment:
+                if "-/" in stripped:
+                    in_block_comment = False
+                continue
+            if not stripped:
+                continue
+            if stripped.startswith("/-"):
+                if "-/" not in stripped:
+                    in_block_comment = True
+                continue
+            if stripped.startswith("--"):
+                continue
+            if stripped == "module":
+                continue
+            if MANAGED_IMPORT_MARKER in line:
+                continue
+            match = IMPORT_RE.match(line)
+            if match is None:
+                break
+            for imported in match.group("mods").split():
+                if is_host_project_module(paths.project_root, imported) and imported not in imports:
+                    imports.append(imported)
+    return tuple(imports)
 
 
 def ensure_module_artifacts(
     paths,
     module_name: str,
-    *,
-    _done: set[str] | None = None,
-    _visiting: set[str] | None = None,
 ) -> None:
-    done = _done if _done is not None else set()
-    visiting = _visiting if _visiting is not None else set()
-    if module_name in done or module_name in visiting:
-        return
-    visiting.add(module_name)
-    source_path = module_name_to_path(paths.project_root, module_name)
-    ilean_path = ilean_path_for_module(paths, module_name)
-    olean_path = olean_path_for_module(paths, module_name)
-    metadata: dict[str, Any] | None = None
-    direct_imports: list[str] = []
-    if ilean_path.exists() and olean_path.exists():
+    build_module(paths, module_name)
+    clear_module_metadata_caches()
+
+
+def source_host_module_closure(
+    paths,
+    root_module: str,
+    *,
+    imports_cache: dict[str, tuple[str, ...]] | None = None,
+) -> tuple[list[str], dict[str, tuple[str, ...]]]:
+    cached_imports = imports_cache if imports_cache is not None else {}
+    queue: deque[str] = deque([root_module])
+    seen: set[str] = set()
+    ordered: list[str] = []
+    while queue:
+        module_name = queue.popleft()
+        if module_name in seen:
+            continue
+        seen.add(module_name)
+        ordered.append(module_name)
+        imports = cached_imports.get(module_name)
+        if imports is None:
+            imports = direct_host_imports_from_source(paths, module_name)
+            cached_imports[module_name] = imports
+        for imported in imports:
+            queue.append(imported)
+    return ordered, {module_name: cached_imports[module_name] for module_name in ordered}
+
+
+def trace_source_hash(paths, module_name: str) -> str | None:
+    trace_path = trace_path_for_module(paths, module_name)
+    if not trace_path.exists():
+        return None
+    trace_data = read_json(trace_path)
+    inputs = trace_data.get("inputs", [])
+    if not isinstance(inputs, list):
+        return None
+    source_path = module_name_to_path(paths.project_root, module_name).resolve()
+    relative_source_suffix = module_name_to_relative_path(module_name).as_posix()
+    for item in inputs:
+        if not isinstance(item, list) or len(item) < 2:
+            continue
+        caption = str(item[0])
+        value = item[1]
+        if not isinstance(value, str):
+            continue
+        caption_matches = False
+        try:
+            caption_matches = Path(caption).resolve() == source_path
+        except OSError:
+            caption_matches = False
+        if not caption_matches:
+            normalized_caption = caption.replace("\\", "/")
+            caption_matches = normalized_caption.endswith(relative_source_suffix)
+        if not caption_matches:
+            continue
+        normalized = value.lower()
+        if re.fullmatch(r"[0-9a-f]{16}", normalized):
+            return normalized
+    return None
+
+
+def collect_artifact_issue_map(
+    paths,
+    modules: list[str],
+    *,
+    source_imports_by_module: dict[str, tuple[str, ...]] | None = None,
+) -> dict[str, ArtifactIssue]:
+    imports_by_module = source_imports_by_module if source_imports_by_module is not None else {}
+    issue_by_module: dict[str, ArtifactIssue] = {}
+    modules_requiring_hash_check: list[str] = []
+    trace_hashes: dict[str, str] = {}
+    for current_module in modules:
+        ilean_path = ilean_path_for_module(paths, current_module)
+        olean_path = olean_path_for_module(paths, current_module)
+        trace_path = trace_path_for_module(paths, current_module)
+        missing: list[str] = []
+        if not ilean_path.exists():
+            missing.append(relative_path_str(paths.project_root, ilean_path))
+        if not olean_path.exists():
+            missing.append(relative_path_str(paths.project_root, olean_path))
+        if not trace_path.exists():
+            missing.append(relative_path_str(paths.project_root, trace_path))
+        if missing:
+            issue_by_module[current_module] = ArtifactIssue(
+                module_name=current_module,
+                detail="缺少构建产物：`" + "`, `".join(missing) + "`",
+            )
+            continue
         metadata = read_json(ilean_path)
-        direct_imports = direct_host_imports_from_metadata(paths, metadata)
-        for imported in direct_imports:
-            ensure_module_artifacts(paths, imported, _done=done, _visiting=visiting)
-    needs_build = not ilean_path.exists() or not olean_path.exists()
-    if not needs_build:
-        artifact_mtime = min(ilean_path.stat().st_mtime_ns, olean_path.stat().st_mtime_ns)
-        if source_path.stat().st_mtime_ns > artifact_mtime:
-            needs_build = True
-        elif direct_host_imports_from_source(paths, module_name) != direct_imports:
-            needs_build = True
+        metadata_imports = direct_host_imports_from_metadata(paths, metadata)
+        source_imports = imports_by_module.get(current_module)
+        if source_imports is None:
+            source_imports = direct_host_imports_from_source(paths, current_module)
+            imports_by_module[current_module] = source_imports
+        if tuple(metadata_imports) != source_imports:
+            issue_by_module[current_module] = ArtifactIssue(
+                module_name=current_module,
+                detail="当前源码 import 列表与 `.ilean` 记录不一致。",
+            )
+            continue
+        recorded_source_hash = trace_source_hash(paths, current_module)
+        if recorded_source_hash is None:
+            issue_by_module[current_module] = ArtifactIssue(
+                module_name=current_module,
+                detail="`.trace` 中缺少当前源码文件的哈希记录。",
+            )
+            continue
+        trace_hashes[current_module] = recorded_source_hash
+        modules_requiring_hash_check.append(current_module)
+    if not modules_requiring_hash_check:
+        return issue_by_module
+    raw_hash_paths: list[Path] = []
+    normalized_hash_texts: dict[Path, str] = {}
+    for current_module in modules_requiring_hash_check:
+        source_path = module_name_to_path(paths.project_root, current_module).resolve()
+        normalized_text, was_normalized = normalize_managed_text(module_source_text(paths, current_module))
+        if was_normalized:
+            normalized_hash_texts[source_path] = normalized_text
         else:
-            for imported in direct_imports:
-                imported_ilean = ilean_path_for_module(paths, imported)
-                imported_olean = olean_path_for_module(paths, imported)
-                imported_mtime = max(imported_ilean.stat().st_mtime_ns, imported_olean.stat().st_mtime_ns)
-                if imported_mtime > artifact_mtime:
-                    needs_build = True
-                    break
-    if needs_build:
-        build_module(paths, module_name)
-        clear_module_metadata_caches()
-    done.add(module_name)
-    visiting.remove(module_name)
+            raw_hash_paths.append(source_path)
+    current_source_hashes = compute_text_file_hashes(paths, raw_hash_paths)
+    current_source_hashes.update(compute_text_hashes_for_texts(paths, normalized_hash_texts))
+    for current_module in modules_requiring_hash_check:
+        source_path = module_name_to_path(paths.project_root, current_module).resolve()
+        current_hash = current_source_hashes.get(source_path)
+        if current_hash is None:
+            fail(
+                "内部错误：缺少当前源码文件的文本哈希。",
+                details=[
+                    f"模块：`{current_module}`",
+                    f"源码：`{relative_path_str(paths.project_root, source_path)}`",
+                ],
+            )
+        if current_hash != trace_hashes[current_module]:
+            issue_by_module[current_module] = ArtifactIssue(
+                module_name=current_module,
+                detail=f"当前源码内容与 `.trace` 记录不一致：`{relative_path_str(paths.project_root, source_path)}`",
+            )
+    return issue_by_module
+
+
+def collect_artifact_issue_state_for_roots(
+    paths,
+    root_modules: list[str],
+) -> tuple[dict[str, list[str]], dict[str, ArtifactIssue]]:
+    imports_cache: dict[str, tuple[str, ...]] = {}
+    root_closures: dict[str, list[str]] = {}
+    union_modules: list[str] = []
+    seen_union: set[str] = set()
+    for root_module in root_modules:
+        closure, _ = source_host_module_closure(
+            paths,
+            root_module,
+            imports_cache=imports_cache,
+        )
+        root_closures[root_module] = closure
+        for module_name in closure:
+            if module_name in seen_union:
+                continue
+            seen_union.add(module_name)
+            union_modules.append(module_name)
+    issue_by_module = collect_artifact_issue_map(
+        paths,
+        union_modules,
+        source_imports_by_module=imports_cache,
+    )
+    return root_closures, issue_by_module
+
+
+def artifact_issues_for_closure(
+    closure: list[str],
+    issue_by_module: dict[str, ArtifactIssue],
+) -> list[ArtifactIssue]:
+    return [issue_by_module[module_name] for module_name in closure if module_name in issue_by_module]
+
+
+def collect_artifact_issues(
+    paths,
+    module_name: str,
+) -> list[ArtifactIssue]:
+    root_closures, issue_by_module = collect_artifact_issue_state_for_roots(paths, [module_name])
+    return artifact_issues_for_closure(root_closures[module_name], issue_by_module)
+
+
+def dedupe_artifact_issues(issues: list[ArtifactIssue]) -> list[ArtifactIssue]:
+    seen: set[tuple[str, str]] = set()
+    unique: list[ArtifactIssue] = []
+    for issue in issues:
+        key = (issue.module_name, issue.detail)
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(issue)
+    return unique
+
+
+def format_artifact_issue_preview(issues: list[ArtifactIssue], *, limit: int = 10) -> str:
+    preview = issues[:limit]
+    lines = [f"- {issue.module_name}: {issue.detail}" for issue in preview]
+    if len(issues) > len(preview):
+        lines.append(f"- 其余模块：{len(issues) - len(preview)} 个")
+    return "\n".join(lines)
+
+
+def fail_for_artifact_issues(
+    paths,
+    *,
+    requested_target: str,
+    root_modules: list[str],
+    issues: list[ArtifactIssue],
+) -> None:
+    unique_issues = dedupe_artifact_issues(issues)
+    hints = []
+    if len(root_modules) == 1:
+        hints.append(f"先运行 `lake build {root_modules[0]}`，或直接运行 `lake build`。")
+    else:
+        hints.append("先运行 `lake build`，确保候选目标模块及其依赖产物都是最新的。")
+    hints.append(
+        f"如需由 `prepare` 自动补构建，可重试：`python3 scripts/temporary_axiom_session.py prepare --target {requested_target} --auto-build`。"
+    )
+    fail(
+        "`prepare` 需要与当前源码一致的模块产物，但当前模块闭包尚未就绪。",
+        details=[
+            f"请求 target：`{requested_target}`",
+            f"涉及根模块：{', '.join(root_modules)}",
+            f"需要刷新的模块：{len(unique_issues)}",
+            "示例：\n" + format_artifact_issue_preview(unique_issues),
+        ],
+        hints=hints,
+    )
+
+
+def ensure_module_artifacts_ready(
+    paths,
+    *,
+    requested_target: str,
+    root_module: str,
+    auto_build: bool,
+) -> None:
+    issues = dedupe_artifact_issues(collect_artifact_issues(paths, root_module))
+    if not issues:
+        return
+    if not auto_build:
+        fail_for_artifact_issues(
+            paths,
+            requested_target=requested_target,
+            root_modules=[root_module],
+            issues=issues,
+        )
+    print("Detected missing or out-of-sync module artifacts before prepare.", flush=True)
+    print(f"- root module: {root_module}", flush=True)
+    print(f"- modules needing refresh: {len(issues)}", flush=True)
+    print(format_artifact_issue_preview(issues), flush=True)
+    print("- refreshing the root module via `lake build` because `--auto-build` was set...", flush=True)
+    ensure_module_artifacts(paths, root_module)
 
 
 @lru_cache(maxsize=None)
@@ -509,38 +778,13 @@ def is_strictly_before(lhs: dict[str, object], rhs: dict[str, object]) -> bool:
     return range_key(lhs) < range_key(rhs)
 
 
-def ensure_decl_range_matches_source(
-    *,
-    module_name: str,
-    decl_name: str,
-    relative_file: str,
-    snippet: str,
-) -> None:
-    short_name = short_decl_name(decl_name)
-    prefix = snippet[:240]
-    if prefix.lstrip().startswith(short_name) or short_name in prefix:
-        return
-    fail(
-        "`.ilean` 给出的声明范围与当前源码不一致。",
-        details=[
-            f"声明：`{decl_name}`",
-            f"模块：`{module_name}`",
-            f"文件：`{relative_file}`",
-            f"源码片段起始：`{prefix.strip()[:120] or '<empty>'}`",
-        ],
-        hints=[
-            "这通常说明源码和 `.ilean` / `.olean` 已经不同步。",
-            f"先重新构建相关模块：`lake build {module_name}`。",
-        ],
-    )
-
-
 def resolve_target_decl(
     paths,
     *,
     decl_name: str,
     module_name: str | None,
     decl_is_short_name: bool = False,
+    candidate_modules: list[str] | None = None,
 ) -> dict[str, object]:
     if module_name is not None:
         if not is_host_project_module(paths.project_root, module_name):
@@ -554,20 +798,11 @@ def resolve_target_decl(
                     "确认 `--target` 里模块部分传入的是项目内的 Lean 模块名。",
                 ],
             )
-        ensure_module_artifacts(paths, module_name)
         resolved_decl_name, range_info = resolve_decl_reference_in_module(
             paths,
             module_name=module_name,
             decl_name=decl_name,
             decl_is_short_name=decl_is_short_name,
-        )
-        target_path = module_name_to_path(paths.project_root, module_name)
-        target_text = target_path.read_text(encoding="utf-8")
-        ensure_decl_range_matches_source(
-            module_name=module_name,
-            decl_name=resolved_decl_name,
-            relative_file=relative_path_str(paths.project_root, target_path),
-            snippet=slice_text_for_decl(target_text, build_line_starts(target_text), range_info),
         )
         return probe_target_decl(
             paths,
@@ -576,7 +811,11 @@ def resolve_target_decl(
             range_info=range_info,
         )
 
-    candidate_modules = candidate_target_modules_from_decl_name(paths, decl_name)
+    candidate_modules = (
+        candidate_modules
+        if candidate_modules is not None
+        else candidate_target_modules_from_decl_name(paths, decl_name)
+    )
     if not candidate_modules:
         fail(
             "无法从完整声明名推断候选模块。",
@@ -588,18 +827,9 @@ def resolve_target_decl(
             ],
         )
     for candidate_module in candidate_modules:
-        ensure_module_artifacts(paths, candidate_module)
         range_info = try_decl_range_from_ilean(paths, candidate_module, decl_name)
         if range_info is None:
             continue
-        target_path = module_name_to_path(paths.project_root, candidate_module)
-        target_text = target_path.read_text(encoding="utf-8")
-        ensure_decl_range_matches_source(
-            module_name=candidate_module,
-            decl_name=decl_name,
-            relative_file=relative_path_str(paths.project_root, target_path),
-            snippet=slice_text_for_decl(target_text, build_line_starts(target_text), range_info),
-        )
         return probe_target_decl(
             paths,
             decl_name=decl_name,
@@ -715,7 +945,7 @@ def module_decl_entries_from_ilean(paths, module_name: str) -> list[dict[str, ob
                 f"期望源码：`{relative_path_str(paths.project_root, path)}`",
             ],
         )
-    relative_file = relative_path_str(paths.project_root, path)
+    relative_file = module_relative_file(paths, module_name)
     entries: list[dict[str, object]] = []
     for decl_name, raw in decls.items():
         if not isinstance(decl_name, str):
@@ -759,9 +989,9 @@ def offset_for_line_column(text: str, line_starts: list[int], line: int, column:
     return start + safe_column
 
 
-def slice_text_for_decl(text: str, line_starts: list[int], range_info: dict[str, int]) -> str:
-    start_line = int(range_info.get("selection_line", range_info["line"]))
-    start_column = int(range_info.get("selection_column", range_info["column"]))
+def slice_command_text_for_decl(text: str, line_starts: list[int], range_info: dict[str, int]) -> str:
+    start_line = int(range_info["line"])
+    start_column = int(range_info["column"])
     end_line = int(range_info["end_line"])
     end_column = int(range_info["end_column"])
     start = offset_for_line_column(text, line_starts, start_line, start_column)
@@ -834,11 +1064,49 @@ def strip_lean_comments_and_strings(text: str) -> str:
     return "".join(out)
 
 
-def decl_uses_explicit_sorry(snippet: str) -> bool:
-    if "sorry" not in snippet:
+def decl_command_keyword_from_sanitized(sanitized: str) -> str | None:
+    idx = 0
+    while idx < len(sanitized):
+        while idx < len(sanitized) and sanitized[idx].isspace():
+            idx += 1
+        if idx >= len(sanitized):
+            return None
+        if sanitized.startswith("@[", idx):
+            idx += 2
+            bracket_depth = 1
+            while idx < len(sanitized) and bracket_depth > 0:
+                char = sanitized[idx]
+                if char == "[":
+                    bracket_depth += 1
+                elif char == "]":
+                    bracket_depth -= 1
+                idx += 1
+            continue
+        match = LEAN_IDENT_RE.match(sanitized, idx)
+        if match is None:
+            return None
+        token = match.group(0)
+        idx = match.end()
+        if token in DECL_MODIFIER_TOKENS:
+            continue
+        return token
+    return None
+
+
+def decl_is_explicit_sorry_theorem(snippet: str) -> bool:
+    if "theorem" not in snippet or "sorry" not in snippet:
         return False
     sanitized = strip_lean_comments_and_strings(snippet)
+    if decl_command_keyword_from_sanitized(sanitized) != "theorem":
+        return False
     return SORRY_TOKEN_RE.search(sanitized) is not None
+
+
+def module_may_contain_sorry_theorem(text: str) -> bool:
+    if "sorry" not in text or "theorem" not in text:
+        return False
+    sanitized = strip_lean_comments_and_strings(text)
+    return SORRY_TOKEN_RE.search(sanitized) is not None and THEOREM_TOKEN_RE.search(sanitized) is not None
 
 
 def collect_permitted_axioms(paths, target_info: dict[str, object]) -> tuple[list[str], list[dict[str, object]]]:
@@ -847,25 +1115,32 @@ def collect_permitted_axioms(paths, target_info: dict[str, object]) -> tuple[lis
     target_decl = str(target_info["decl_name"])
     candidate_entries: list[dict[str, object]] = []
     for module_name in closure:
+        source_text = normalized_module_source_text(paths, module_name)
+        line_starts: list[int] | None = None
+        scan_text = source_text
+        if module_name == target_module:
+            line_starts = normalized_module_source_line_starts(paths, module_name)
+            target_scan_end = offset_for_line_column(
+                source_text,
+                line_starts,
+                int(target_info["range"]["line"]),
+                int(target_info["range"]["column"]),
+            )
+            scan_text = source_text[:target_scan_end]
+        if not module_may_contain_sorry_theorem(scan_text):
+            continue
+        if line_starts is None:
+            line_starts = normalized_module_source_line_starts(paths, module_name)
         entries = module_decl_entries_from_ilean(paths, module_name)
         if not entries:
             continue
-        module_path = module_name_to_path(paths.project_root, module_name)
-        source_text = module_path.read_text(encoding="utf-8")
-        line_starts = build_line_starts(source_text)
         for entry in entries:
             if str(entry["decl_name"]) == target_decl:
                 continue
             if module_name == target_module and not is_strictly_before(entry, target_info):
                 break
-            snippet = slice_text_for_decl(source_text, line_starts, entry["range"])
-            ensure_decl_range_matches_source(
-                module_name=module_name,
-                decl_name=str(entry["decl_name"]),
-                relative_file=str(entry["file"]),
-                snippet=snippet,
-            )
-            if not decl_uses_explicit_sorry(snippet):
+            command_snippet = slice_command_text_for_decl(source_text, line_starts, entry["range"])
+            if not decl_is_explicit_sorry_theorem(command_snippet):
                 continue
             candidate_entries.append(entry)
     permitted_by_name: dict[str, dict[str, object]] = {}
@@ -1083,18 +1358,6 @@ def ensure_active_session_consistent(paths, inspection: SessionInspection) -> di
     return session_payload
 
 
-def ensure_file_is_not_already_managed(text: str, *, file_label: str) -> None:
-    if MANAGED_IMPORT_MARKER in text or MANAGED_ATTR_PREFIX in text:
-        fail(
-            "检测到未清理的 managed 标记，不能重复 prepare。",
-            details=[f"文件：`{file_label}`"],
-            hints=[
-                "先运行 `python3 scripts/temporary_axiom_session.py cleanup`。",
-                "如果上一次 session 被中断，先检查源码后再手动清理残留标记。",
-            ],
-        )
-
-
 def attr_marker_line(decl_name: str) -> str:
     return f"@[temporary_axiom] {MANAGED_ATTR_PREFIX} {decl_name}"
 
@@ -1147,60 +1410,125 @@ def add_managed_import(lines: list[str]) -> bool:
     return True
 
 
-def add_managed_attributes(lines: list[str], file_entries: list[dict[str, object]]) -> list[dict[str, str]]:
+def normalize_managed_line(line: str) -> list[str]:
+    if MANAGED_IMPORT_MARKER in line:
+        return []
+    if MANAGED_ATTR_PREFIX not in line:
+        return [line]
+    marker = f" {MANAGED_ATTR_PREFIX} "
+    if marker in line:
+        cleaned = line.replace(marker + line.partition(marker)[2], "", 1)
+    else:
+        cleaned = line.partition(MANAGED_ATTR_PREFIX)[0].rstrip()
+    cleaned = cleaned.replace("@[temporary_axiom, ", "@[", 1)
+    if cleaned.strip() == "@[temporary_axiom]":
+        return []
+    return [cleaned.rstrip()]
+
+
+def normalize_managed_lines(lines: list[str]) -> tuple[list[str], bool]:
+    normalized: list[str] = []
+    changed = False
+    for line in lines:
+        replacement = normalize_managed_line(line)
+        if len(replacement) != 1 or replacement[0] != line:
+            changed = True
+        normalized.extend(replacement)
+    return normalized, changed
+
+
+def normalize_managed_text(text: str) -> tuple[str, bool]:
+    normalized_lines, changed = normalize_managed_lines(text.splitlines())
+    normalized_text = "\n".join(normalized_lines)
+    if text.endswith("\n"):
+        normalized_text += "\n"
+    return normalized_text, changed
+
+
+def attribute_insertion_index(lines: list[str], entry: dict[str, object]) -> int:
+    range_info = entry["range"]
+    assert isinstance(range_info, dict)
+    start_idx = int(range_info["line"]) - 1
+    selection_idx = int(range_info.get("selection_line", range_info["line"])) - 1
+    if start_idx < 0 or selection_idx < 0 or selection_idx > len(lines):
+        fail(
+            "声明的源码范围超出文件边界。",
+            details=[
+                f"声明：`{entry['decl_name']}`",
+                f"起始行：{range_info['line']}",
+                f"选择行：{range_info.get('selection_line', range_info['line'])}",
+            ],
+            hints=[
+                "这通常说明源码和 `.ilean` 不一致；请先重新构建相关模块。",
+            ],
+        )
+    header_end = min(selection_idx + 1, len(lines))
+    for idx in range(max(0, start_idx), header_end):
+        if lines[idx].lstrip().startswith("@["):
+            return idx
+    return min(selection_idx, len(lines))
+
+
+def decl_header_contains_temporary_axiom(text: str, line_starts: list[int], range_info: dict[str, int]) -> bool:
+    snippet = slice_command_text_for_decl(text, line_starts, range_info)
+    if "temporary_axiom" not in snippet:
+        return False
+    sanitized = strip_lean_comments_and_strings(snippet)
+    idx = 0
+    while idx < len(sanitized):
+        while idx < len(sanitized) and sanitized[idx].isspace():
+            idx += 1
+        if idx >= len(sanitized):
+            return False
+        if sanitized.startswith("@[", idx):
+            bracket_depth = 1
+            probe = idx + 2
+            while probe < len(sanitized) and bracket_depth > 0:
+                char = sanitized[probe]
+                if char == "[":
+                    bracket_depth += 1
+                elif char == "]":
+                    bracket_depth -= 1
+                probe += 1
+            if "temporary_axiom" in sanitized[idx:probe]:
+                return True
+            idx = probe
+            continue
+        match = LEAN_IDENT_RE.match(sanitized, idx)
+        if match is None:
+            return False
+        token = match.group(0)
+        idx = match.end()
+        if token in DECL_MODIFIER_TOKENS:
+            continue
+        return False
+    return False
+
+
+def add_managed_attributes(
+    *,
+    text: str,
+    lines: list[str],
+    file_entries: list[dict[str, object]],
+) -> list[dict[str, str]]:
+    line_starts = build_line_starts(text)
     inserted_for: list[dict[str, str]] = []
     for entry in sorted(
         file_entries,
         key=lambda item: (
-            int(item["range"]["line"]),
-            int(item["range"]["column"]),
+            attribute_insertion_index(lines, item),
+            int(item["range"].get("selection_line", item["range"]["line"])),
             str(item["decl_name"]),
         ),
         reverse=True,
     ):
         decl_name = str(entry["decl_name"])
-        marker_line = attr_marker_line(decl_name)
-        insertion_line = int(entry["range"].get("selection_line", entry["range"]["line"]))
-        start_idx = insertion_line - 1
-        if start_idx < 0 or start_idx > len(lines):
-            fail(
-                "声明的源码范围超出文件边界。",
-                details=[
-                    f"声明：`{decl_name}`",
-                    f"插入行：{insertion_line}",
-                ],
-                hints=[
-                    "这通常说明源码和 `.ilean` 不一致；请先重新构建相关模块。",
-                ],
-            )
-        lower = max(0, start_idx - 2)
-        if any("temporary_axiom" in line for line in lines[lower:start_idx + 1]):
-            fail(
-                "声明附近已经存在 `temporary_axiom` 标记。",
-                details=[f"声明：`{decl_name}`"],
-                hints=[
-                    "先清理已有标签，再重新运行 `prepare`。",
-                    "如果这是手工写入的标签，请先确认它是否应由本次 session 接管。",
-                ],
-            )
-        if start_idx < len(lines) and lines[start_idx].lstrip().startswith("@["):
-            current = lines[start_idx]
-            if "--" in current:
-                fail(
-                    "attribute 行带有尾注释，当前版本无法安全改写。",
-                    details=[
-                        f"声明：`{decl_name}`",
-                        f"原始行：`{current.strip()}`",
-                    ],
-                    hints=[
-                        "把注释移到上一行，或手动整理 attribute 行后再运行 `prepare`。",
-                    ],
-                )
-            lines[start_idx] = current.replace("@[", "@[temporary_axiom, ", 1) + f" {MANAGED_ATTR_PREFIX} {decl_name}"
-            inserted_for.append({"decl_name": decl_name, "mode": "patched_existing_attr"})
-        else:
-            lines.insert(start_idx, marker_line)
-            inserted_for.append({"decl_name": decl_name, "mode": "inserted_line"})
+        range_info = entry["range"]
+        assert isinstance(range_info, dict)
+        if decl_header_contains_temporary_axiom(text, line_starts, range_info):
+            continue
+        lines.insert(attribute_insertion_index(lines, entry), attr_marker_line(decl_name))
+        inserted_for.append({"decl_name": decl_name, "mode": "inserted_line"})
     inserted_for.reverse()
     return inserted_for
 
@@ -1209,7 +1537,10 @@ def write_lines(path: Path, lines: list[str]) -> None:
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
-def apply_prepare_edits(paths, permitted_axioms: list[dict[str, object]]) -> dict[str, list[dict[str, str]]]:
+def apply_prepare_edits(
+    paths,
+    permitted_axioms: list[dict[str, object]],
+) -> dict[str, list[dict[str, str]]]:
     grouped: dict[str, list[dict[str, object]]] = defaultdict(list)
     for entry in permitted_axioms:
         grouped[str(entry["file"])].append(entry)
@@ -1228,10 +1559,14 @@ def apply_prepare_edits(paths, permitted_axioms: list[dict[str, object]]) -> dic
                 )
             original_text = path.read_text(encoding="utf-8")
             originals[path] = original_text
-            ensure_file_is_not_already_managed(original_text, file_label=relative_file)
-            lines = original_text.splitlines()
-            inserted_decls = add_managed_attributes(lines, file_entries)
-            if add_managed_import(lines):
+            lines, _ = normalize_managed_lines(original_text.splitlines())
+            normalized_text = "\n".join(lines) + "\n"
+            inserted_decls = add_managed_attributes(
+                text=normalized_text,
+                lines=lines,
+                file_entries=file_entries,
+            )
+            if file_entries and add_managed_import(lines):
                 edits["imports"].append({"file": relative_file})
             for attr_edit in inserted_decls:
                 edits["attributes"].append(
@@ -1241,7 +1576,8 @@ def apply_prepare_edits(paths, permitted_axioms: list[dict[str, object]]) -> dic
                         "mode": attr_edit["mode"],
                     }
                 )
-            write_lines(path, lines)
+            if "\n".join(lines) + "\n" != original_text:
+                write_lines(path, lines)
     except Exception:
         for path, original_text in originals.items():
             path.write_text(original_text, encoding="utf-8")
@@ -1346,14 +1682,78 @@ def prepare_session(args: argparse.Namespace, paths) -> None:
                 requested_hash=str(requested_target_info["statement_hash"]),
                 session_payload=session_payload,
             )
-        ensure_no_stale_workspace_state(paths, inspection)
+        if not inspection.runtime_is_reset:
+            reset_generated_runtime(paths)
+
+        candidate_modules: list[str] | None = None
+        if requested_target.module_name is None:
+            candidate_modules = candidate_target_modules_from_decl_name(paths, requested_target.decl_name)
+            if not candidate_modules:
+                fail(
+                    "无法从完整声明名推断候选模块。",
+                    details=[
+                        f"目标声明：`{requested_target.decl_name}`",
+                    ],
+                    hints=[
+                        "如果该声明名与模块路径不对齐，请改用 `--target <module>:<decl>`。",
+                    ],
+                )
+
+        ready_candidate_modules: list[str] | None = None
+        if requested_target.module_name is not None:
+            print("Checking build artifacts for the target module closure...", flush=True)
+            ensure_module_artifacts_ready(
+                paths,
+                requested_target=args.target,
+                root_module=requested_target.module_name,
+                auto_build=args.auto_build,
+            )
+        else:
+            assert candidate_modules is not None
+            print("Checking build artifacts for candidate target modules...", flush=True)
+            candidate_closures, issue_by_module = collect_artifact_issue_state_for_roots(
+                paths,
+                candidate_modules,
+            )
+            ready_candidate_modules = []
+            if not args.auto_build:
+                blocked_issues: list[ArtifactIssue] = []
+                for candidate_module in candidate_modules:
+                    issues = artifact_issues_for_closure(candidate_closures[candidate_module], issue_by_module)
+                    if issues:
+                        blocked_issues.extend(issues)
+                        continue
+                    ready_candidate_modules.append(candidate_module)
+                if not ready_candidate_modules and blocked_issues:
+                    fail_for_artifact_issues(
+                        paths,
+                        requested_target=args.target,
+                        root_modules=candidate_modules,
+                        issues=blocked_issues,
+                    )
+            else:
+                remaining_issue_by_module = dict(issue_by_module)
+                for candidate_module in candidate_modules:
+                    issues = artifact_issues_for_closure(
+                        candidate_closures[candidate_module],
+                        remaining_issue_by_module,
+                    )
+                    if issues:
+                        print(f"Refreshing artifacts for candidate module `{candidate_module}`...", flush=True)
+                        print(format_artifact_issue_preview(dedupe_artifact_issues(issues)), flush=True)
+                        ensure_module_artifacts(paths, candidate_module)
+                        for module_name in candidate_closures[candidate_module]:
+                            remaining_issue_by_module.pop(module_name, None)
+                    ready_candidate_modules.append(candidate_module)
         ensure_probe_tool_ready(paths)
         target_info = resolve_target_decl(
             paths,
             decl_name=requested_target.decl_name,
             module_name=requested_target.module_name,
             decl_is_short_name=requested_target.decl_is_short_name,
+            candidate_modules=ready_candidate_modules,
         )
+        print("Scanning module closure for explicit `sorry` theorems...", flush=True)
         module_closure, permitted_axioms = collect_permitted_axioms(paths, target_info)
         base_commit = args.base_commit if args.base_commit is not None else try_git_head(paths)
         write_generated_runtime(
@@ -1470,6 +1870,11 @@ def build_parser() -> argparse.ArgumentParser:
     prepare.add_argument(
         "--base-commit",
         help="Optional base commit note. Defaults to the current HEAD when available.",
+    )
+    prepare.add_argument(
+        "--auto-build",
+        action="store_true",
+        help="Automatically refresh stale or missing module artifacts before resolving the target.",
     )
 
     subparsers.add_parser("cleanup", help="Remove the active session's managed edits and generated files.")
