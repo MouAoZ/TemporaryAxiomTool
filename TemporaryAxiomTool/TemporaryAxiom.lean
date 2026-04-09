@@ -85,13 +85,14 @@ Suggested fixes:\n
 这样能拦住隐式参数、universe 或命名空间解析导致的真实陈述漂移。
 -/
 private meta def validateTemporaryAxiomTarget (declName : Name) : AttrM Unit := do
+  let runtimeDeclName := declName.eraseMacroScopes
   let frozenTargetName ← targetName
   if frozenTargetName == Name.anonymous then
     throwError (noActivePreparedSessionMessage declName)
-  if declName == frozenTargetName then
+  if runtimeDeclName == frozenTargetName then
     throwError (targetTheoremTaggedMessage declName)
   let constInfo ← getConstInfo declName
-  let permittedEntry ← match (← permittedEntryFor declName) with
+  let permittedEntry ← match (← permittedEntryFor runtimeDeclName) with
     | some entry => pure entry
     | none =>
         throwError m!"{declarationNotPermittedMessage declName}\n

@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import argparse
+import os
 import re
+from concurrent.futures import ThreadPoolExecutor
 from collections import defaultdict, deque
 from dataclasses import dataclass
 from functools import lru_cache
@@ -12,6 +14,7 @@ from .common import (
     IMPORT_RE,
     MANAGED_ATTR_PREFIX,
     MANAGED_IMPORT_MARKER,
+    TOOL_PREPARED_SESSION_TARGET_MODULE,
     TOOL_TEMPORARY_AXIOM_MODULE,
     acquire_prepare_lock,
     ensure_layout,
@@ -156,6 +159,10 @@ class ArtifactIssue:
 
 def relative_path_str(project_root: Path, path: Path) -> str:
     return path.resolve().relative_to(project_root.resolve()).as_posix()
+
+
+def text_contains_managed_markers(text: str) -> bool:
+    return MANAGED_IMPORT_MARKER in text or MANAGED_ATTR_PREFIX in text
 
 
 def normalize_range(raw: list[object]) -> dict[str, int]:
@@ -360,6 +367,7 @@ def print_prepare_summary(
     target_info: dict[str, object],
     module_closure: list[str],
     grouped_permitted_axioms: dict[str, list[dict[str, str]]],
+    verified: bool,
 ) -> None:
     permitted_count = sum(len(entries) for entries in grouped_permitted_axioms.values())
     involved_modules_count = len(module_closure)
@@ -384,6 +392,10 @@ def print_prepare_summary(
                     print(f"    - {entry['decl_name']}")
     else:
         print("- permitted temporary axiom list is long; see the saved report for the full grouped list.")
+    if verified:
+        print("- final target-module verification: completed during prepare")
+    else:
+        print("- final target-module verification: skipped by default; use `prepare --verify` to enable it")
     print(f"- session data: {relative_path_str(paths.project_root, paths.session_file)}")
     print(f"- human-readable report: {relative_path_str(paths.project_root, paths.report_file)}")
 
@@ -408,13 +420,25 @@ def module_source_text(paths, module_name: str) -> str:
 
 @lru_cache(maxsize=None)
 def normalized_module_source_text(paths, module_name: str) -> str:
-    normalized_text, _ = normalize_managed_text(module_source_text(paths, module_name))
-    return normalized_text
+    return normalized_module_source_result(paths, module_name)[0]
+
+
+@lru_cache(maxsize=None)
+def normalized_module_source_result(paths, module_name: str) -> tuple[str, bool]:
+    text = module_source_text(paths, module_name)
+    if not text_contains_managed_markers(text):
+        return text, False
+    return normalize_managed_text(text)
 
 
 @lru_cache(maxsize=None)
 def normalized_module_source_line_starts(paths, module_name: str) -> list[int]:
     return build_line_starts(normalized_module_source_text(paths, module_name))
+
+
+@lru_cache(maxsize=None)
+def sanitized_module_source_text(paths, module_name: str) -> str:
+    return strip_lean_comments_and_strings(normalized_module_source_text(paths, module_name))
 
 
 @lru_cache(maxsize=None)
@@ -426,6 +450,10 @@ def module_relative_file(paths, module_name: str) -> str:
 def clear_module_metadata_caches() -> None:
     load_ilean_metadata.cache_clear()
     module_decl_entries_from_ilean.cache_clear()
+    normalized_module_source_result.cache_clear()
+    normalized_module_source_text.cache_clear()
+    normalized_module_source_line_starts.cache_clear()
+    sanitized_module_source_text.cache_clear()
 
 
 def direct_host_imports_from_metadata(paths, metadata: dict[str, Any]) -> list[str]:
@@ -566,7 +594,7 @@ def collect_artifact_issue_map(
                 detail="缺少构建产物：`" + "`, `".join(missing) + "`",
             )
             continue
-        metadata = read_json(ilean_path)
+        metadata = load_ilean_metadata(paths, current_module)
         metadata_imports = direct_host_imports_from_metadata(paths, metadata)
         source_imports = imports_by_module.get(current_module)
         if source_imports is None:
@@ -593,7 +621,7 @@ def collect_artifact_issue_map(
     normalized_hash_texts: dict[Path, str] = {}
     for current_module in modules_requiring_hash_check:
         source_path = module_name_to_path(paths.project_root, current_module).resolve()
-        normalized_text, was_normalized = normalize_managed_text(module_source_text(paths, current_module))
+        normalized_text, was_normalized = normalized_module_source_result(paths, current_module)
         if was_normalized:
             normalized_hash_texts[source_path] = normalized_text
         else:
@@ -654,14 +682,6 @@ def artifact_issues_for_closure(
     return [issue_by_module[module_name] for module_name in closure if module_name in issue_by_module]
 
 
-def collect_artifact_issues(
-    paths,
-    module_name: str,
-) -> list[ArtifactIssue]:
-    root_closures, issue_by_module = collect_artifact_issue_state_for_roots(paths, [module_name])
-    return artifact_issues_for_closure(root_closures[module_name], issue_by_module)
-
-
 def dedupe_artifact_issues(issues: list[ArtifactIssue]) -> list[ArtifactIssue]:
     seen: set[tuple[str, str]] = set()
     unique: list[ArtifactIssue] = []
@@ -716,10 +736,11 @@ def ensure_module_artifacts_ready(
     requested_target: str,
     root_module: str,
     auto_build: bool,
-) -> None:
-    issues = dedupe_artifact_issues(collect_artifact_issues(paths, root_module))
+) -> list[str]:
+    root_closures, issue_by_module = collect_artifact_issue_state_for_roots(paths, [root_module])
+    issues = dedupe_artifact_issues(artifact_issues_for_closure(root_closures[root_module], issue_by_module))
     if not issues:
-        return
+        return root_closures[root_module]
     if not auto_build:
         fail_for_artifact_issues(
             paths,
@@ -733,6 +754,8 @@ def ensure_module_artifacts_ready(
     print(format_artifact_issue_preview(issues), flush=True)
     print("- refreshing the root module via `lake build` because `--auto-build` was set...", flush=True)
     ensure_module_artifacts(paths, root_module)
+    refreshed_closure, _ = source_host_module_closure(paths, root_module)
+    return refreshed_closure
 
 
 @lru_cache(maxsize=None)
@@ -990,7 +1013,7 @@ def collect_axiomized_probed_declarations(
     grouped: dict[str, list[dict[str, object]]] = defaultdict(list)
     for entry in candidates:
         grouped[str(entry["module"])].append(entry)
-    normalized: list[dict[str, object]] = []
+    job_specs: list[tuple[str, list[dict[str, object]], str]] = []
     for module_name, module_entries in sorted(grouped.items()):
         source_text = normalized_module_source_text(paths, module_name)
         line_starts = normalized_module_source_line_starts(paths, module_name)
@@ -1003,7 +1026,13 @@ def collect_axiomized_probed_declarations(
             )
             for entry in module_entries
         )
-        prefix_source = source_text[:replay_end]
+        job_specs.append((module_name, module_entries, source_text[:replay_end]))
+
+    def run_probe_job(
+        module_name: str,
+        module_entries: list[dict[str, object]],
+        prefix_source: str,
+    ) -> tuple[str, list[dict[str, object]], Any, list[dict[str, object]]]:
         result, payloads = run_lean_source(
             paths,
             source=build_axiom_probe_source(
@@ -1013,6 +1042,27 @@ def collect_axiomized_probed_declarations(
             description=f"按 axiom 语义探测模块 `{module_name}` 中的 permitted declarations",
             allow_failure=True,
         )
+        return module_name, module_entries, result, payloads
+
+    max_workers = min(len(job_specs), max(1, min(os.cpu_count() or 1, 4)))
+    if max_workers <= 1:
+        job_results = [run_probe_job(module_name, module_entries, prefix_source) for module_name, module_entries, prefix_source in job_specs]
+    else:
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = [
+                executor.submit(run_probe_job, module_name, module_entries, prefix_source)
+                for module_name, module_entries, prefix_source in job_specs
+            ]
+            job_results = [future.result() for future in futures]
+
+    result_by_module = {
+        module_name: (module_entries, result, payloads)
+        for module_name, module_entries, result, payloads in job_results
+    }
+
+    normalized: list[dict[str, object]] = []
+    for module_name, _, _ in job_specs:
+        module_entries, result, payloads = result_by_module[module_name]
         payload_by_name = {str(payload["decl_name"]): payload for payload in payloads}
         missing_decl_names = [
             str(entry["decl_name"])
@@ -1222,31 +1272,41 @@ def decl_command_keyword_from_sanitized(sanitized: str) -> str | None:
     return None
 
 
-def decl_is_explicit_sorry_theorem(snippet: str) -> bool:
-    if "theorem" not in snippet or "sorry" not in snippet:
+def decl_is_explicit_sorry_theorem_sanitized(sanitized_snippet: str) -> bool:
+    if "theorem" not in sanitized_snippet or "sorry" not in sanitized_snippet:
         return False
-    sanitized = strip_lean_comments_and_strings(snippet)
-    if decl_command_keyword_from_sanitized(sanitized) != "theorem":
+    if decl_command_keyword_from_sanitized(sanitized_snippet) != "theorem":
         return False
-    return SORRY_TOKEN_RE.search(sanitized) is not None
+    return SORRY_TOKEN_RE.search(sanitized_snippet) is not None
 
 
-def module_may_contain_sorry_theorem(text: str) -> bool:
-    if "sorry" not in text or "theorem" not in text:
+def module_may_contain_sorry_theorem_sanitized(sanitized_text: str) -> bool:
+    if "sorry" not in sanitized_text or "theorem" not in sanitized_text:
         return False
-    sanitized = strip_lean_comments_and_strings(text)
-    return SORRY_TOKEN_RE.search(sanitized) is not None and THEOREM_TOKEN_RE.search(sanitized) is not None
+    return SORRY_TOKEN_RE.search(sanitized_text) is not None and THEOREM_TOKEN_RE.search(sanitized_text) is not None
 
 
-def collect_permitted_axioms(paths, target_info: dict[str, object]) -> tuple[list[str], list[dict[str, object]]]:
+def collect_permitted_axioms(
+    paths,
+    target_info: dict[str, object],
+    *,
+    module_closure: list[str] | None = None,
+) -> tuple[list[str], list[dict[str, object]]]:
     target_module = str(target_info["module"])
-    closure = compute_module_closure(paths, target_module)
+    closure = (
+        list(module_closure)
+        if module_closure is not None
+        else compute_module_closure(paths, target_module)
+    )
     target_decl = str(target_info["decl_name"])
     candidate_entries: list[dict[str, object]] = []
     for module_name in closure:
         source_text = normalized_module_source_text(paths, module_name)
+        if "sorry" not in source_text or "theorem" not in source_text:
+            continue
+        sanitized_text = sanitized_module_source_text(paths, module_name)
         line_starts: list[int] | None = None
-        scan_text = source_text
+        sanitized_scan_text = sanitized_text
         if module_name == target_module:
             line_starts = normalized_module_source_line_starts(paths, module_name)
             target_scan_end = offset_for_line_column(
@@ -1255,8 +1315,8 @@ def collect_permitted_axioms(paths, target_info: dict[str, object]) -> tuple[lis
                 int(target_info["range"]["line"]),
                 int(target_info["range"]["column"]),
             )
-            scan_text = source_text[:target_scan_end]
-        if not module_may_contain_sorry_theorem(scan_text):
+            sanitized_scan_text = sanitized_text[:target_scan_end]
+        if not module_may_contain_sorry_theorem_sanitized(sanitized_scan_text):
             continue
         if line_starts is None:
             line_starts = normalized_module_source_line_starts(paths, module_name)
@@ -1268,8 +1328,8 @@ def collect_permitted_axioms(paths, target_info: dict[str, object]) -> tuple[lis
                 continue
             if module_name == target_module and not is_strictly_before(entry, target_info):
                 break
-            command_snippet = slice_command_text_for_decl(source_text, line_starts, entry["range"])
-            if not decl_is_explicit_sorry_theorem(command_snippet):
+            sanitized_snippet = slice_command_text_for_decl(sanitized_text, line_starts, entry["range"])
+            if not decl_is_explicit_sorry_theorem_sanitized(sanitized_snippet):
                 continue
             candidate_entries.append(entry)
     permitted_by_name: dict[str, dict[str, object]] = {}
@@ -1888,7 +1948,10 @@ def apply_prepare_edits(
                 )
             original_text = path.read_text(encoding="utf-8")
             originals[path] = original_text
-            lines, _ = normalize_managed_lines(original_text.splitlines())
+            if text_contains_managed_markers(original_text):
+                lines, _ = normalize_managed_lines(original_text.splitlines())
+            else:
+                lines = original_text.splitlines()
             normalized_text = "\n".join(lines) + "\n"
             host_modules = {str(entry["module"]) for entry in file_entries}
             if len(host_modules) != 1:
@@ -1905,8 +1968,9 @@ def apply_prepare_edits(
                 lines=lines,
                 file_entries=file_entries,
             )
-            if file_entries and add_managed_import(lines, import_module=import_module):
-                edits["imports"].append({"file": relative_file, "module": import_module})
+            for managed_import in (TOOL_PREPARED_SESSION_TARGET_MODULE, import_module):
+                if file_entries and add_managed_import(lines, import_module=managed_import):
+                    edits["imports"].append({"file": relative_file, "module": managed_import})
             for attr_edit in inserted_decls:
                 edits["attributes"].append(
                     {
@@ -2039,9 +2103,10 @@ def prepare_session(args: argparse.Namespace, paths) -> None:
                 )
 
         ready_candidate_modules: list[str] | None = None
+        prepared_closures_by_root: dict[str, list[str]] = {}
         if requested_target.module_name is not None:
             print("Checking build artifacts for the target module closure...", flush=True)
-            ensure_module_artifacts_ready(
+            prepared_closures_by_root[requested_target.module_name] = ensure_module_artifacts_ready(
                 paths,
                 requested_target=args.target,
                 root_module=requested_target.module_name,
@@ -2054,6 +2119,7 @@ def prepare_session(args: argparse.Namespace, paths) -> None:
                 paths,
                 candidate_modules,
             )
+            prepared_closures_by_root.update(candidate_closures)
             ready_candidate_modules = []
             if not args.auto_build:
                 blocked_issues: list[ArtifactIssue] = []
@@ -2093,7 +2159,11 @@ def prepare_session(args: argparse.Namespace, paths) -> None:
             candidate_modules=ready_candidate_modules,
         )
         print("Scanning module closure for explicit `sorry` theorems and replaying axiom-side hashes...", flush=True)
-        module_closure, permitted_axioms = collect_permitted_axioms(paths, target_info)
+        module_closure, permitted_axioms = collect_permitted_axioms(
+            paths,
+            target_info,
+            module_closure=prepared_closures_by_root.get(str(target_info["module"])),
+        )
         base_commit = args.base_commit if args.base_commit is not None else try_git_head(paths)
         write_generated_runtime(
             paths,
@@ -2106,7 +2176,12 @@ def prepare_session(args: argparse.Namespace, paths) -> None:
             reset_generated_runtime(paths)
             raise
         try:
-            build_prepared_target_module(paths, target_module=str(target_info["module"]))
+            if args.verify:
+                print(
+                    f"Verifying prepared workspace by rebuilding `{target_info['module']}`...",
+                    flush=True,
+                )
+                build_prepared_target_module(paths, target_module=str(target_info["module"]))
             session_payload = {
                 "schema_version": 3,
                 "base_commit": base_commit,
@@ -2137,7 +2212,8 @@ def prepare_session(args: argparse.Namespace, paths) -> None:
                 session_payload=session_payload,
                 permitted_axioms=permitted_axioms,
             )
-            ensure_active_session_consistent(paths, inspect_session_state(paths))
+            if args.verify:
+                ensure_active_session_consistent(paths, inspect_session_state(paths))
         except BaseException:
             cleanup_session_artifacts(paths, edits)
             reset_generated_runtime(paths)
@@ -2148,6 +2224,7 @@ def prepare_session(args: argparse.Namespace, paths) -> None:
             target_info=target_info,
             module_closure=module_closure,
             grouped_permitted_axioms=grouped_permitted_axioms,
+            verified=args.verify,
         )
     finally:
         release_prepare_lock(paths)
@@ -2216,6 +2293,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--auto-build",
         action="store_true",
         help="Automatically refresh stale or missing module artifacts before resolving the target.",
+    )
+    prepare.add_argument(
+        "--verify",
+        action="store_true",
+        help="After prepare writes runtime shards and managed edits, rebuild the target module once to confirm the prepared workspace immediately.",
     )
 
     subparsers.add_parser("cleanup", help="Remove the active session's managed edits and generated files.")

@@ -8,15 +8,17 @@ open Lean
 
 /-- Lean 运行时视角下的一条当前 session 允许的临时公理条目。 -/
 public structure PermittedAxiom where
-  declNameText : String
+  name : Name
   statementHash : UInt64
   deriving Inhabited, Repr
 
-public abbrev PermittedAxiomMap := Std.HashMap String PermittedAxiom
+public abbrev PermittedAxiomBatch := Array PermittedAxiom
+
+public abbrev PermittedAxiomMap := NameMap PermittedAxiom
 
 public def insertPermittedAxioms
     (entriesMap : PermittedAxiomMap)
-    (entries : Array PermittedAxiom) : PermittedAxiomMap :=
-  entries.foldl (init := entriesMap) fun acc entry => acc.insert entry.declNameText entry
+    (entries : PermittedAxiomBatch) : PermittedAxiomMap :=
+  entries.foldl (init := entriesMap) fun acc entry => acc.insert entry.name entry
 
 end TemporaryAxiomTool.PreparedSession

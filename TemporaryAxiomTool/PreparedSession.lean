@@ -9,7 +9,7 @@ public import TemporaryAxiomTool.PreparedSession.Types
 public meta import TemporaryAxiomTool.PreparedSession.Types
 public meta import TemporaryAxiomTool.StatementHash
 
-open Lean Elab Command
+open Lean Parser Elab Command
 
 namespace TemporaryAxiomTool.PreparedSession
 
@@ -77,61 +77,6 @@ elab "#print_temporary_axiom_decl_probe " quotedName:term : command => do
         moduleName
         (TemporaryAxiomTool.statementHashOfConstInfo constInfo)).compress
 
-private def generatedTargetMarkerPrefix : String :=
-  "TemporaryAxiomTool.PreparedSession.Target.target_decl_"
-
-private def generatedPermittedModulePrefix : String :=
-  "TemporaryAxiomTool.PreparedSession.Permitted."
-
-private def generatedPermittedMarkerSegment : String :=
-  ".permitted_decl_"
-
-private def generatedPermittedHashSegment : String :=
-  "__hash_"
-
-private def encodedRuntimeStringPrefix : String :=
-  "u_"
-
-private def stripStringPrefix? (pre text : String) : Option String :=
-  if text.startsWith pre then
-    some (text.drop pre.length |>.toString)
-  else
-    none
-
-private def decodeRuntimeStringComponent? (encoded : String) : Option String := do
-  let payload ← stripStringPrefix? encodedRuntimeStringPrefix encoded
-  if payload == "empty" then
-    return ""
-  let mut chars : Array Char := #[]
-  for codeText in payload.splitOn "_" do
-    if codeText.isEmpty then
-      failure
-    let codePoint ← codeText.toNat?
-    chars := chars.push (Char.ofNat codePoint)
-  return String.ofList chars.toList
-
-private def parseGeneratedTargetDeclName? (declName : Name) : Option Name := do
-  let encodedDecl ← stripStringPrefix? generatedTargetMarkerPrefix (toString declName)
-  let declNameText ← decodeRuntimeStringComponent? encodedDecl
-  return declNameText.toName
-
-private def parseGeneratedPermittedAxiom? (declName : Name) : Option PermittedAxiom := do
-  let constNameText := toString declName
-  if !constNameText.startsWith generatedPermittedModulePrefix then
-    failure
-  match constNameText.splitOn generatedPermittedMarkerSegment with
-  | [_modulePart, markerPayload] =>
-      match markerPayload.splitOn generatedPermittedHashSegment with
-      | [encodedDecl, statementHash] =>
-          let declNameText ← decodeRuntimeStringComponent? encodedDecl
-          let hashNat ← statementHash.toNat?
-          some {
-            declNameText := declNameText
-            statementHash := hashNat.toUInt64
-          }
-      | _ => none
-  | _ => none
-
 public initialize targetRuntimeExt : SimplePersistentEnvExtension Name (Option Name) ←
   registerSimplePersistentEnvExtension {
     name := `temporaryAxiomTargetRuntimeExt
@@ -141,42 +86,97 @@ public initialize targetRuntimeExt : SimplePersistentEnvExtension Name (Option N
         entries.foldl (init := state) fun _ declName => some declName
   }
 
-public initialize permittedAxiomRuntimeExt : SimplePersistentEnvExtension PermittedAxiom PermittedAxiomMap ←
+private def insertPermittedAxiomBatch
+    (state : PermittedAxiomMap)
+    (entries : PermittedAxiomBatch) : PermittedAxiomMap :=
+  insertPermittedAxioms state entries
+
+private def insertImportedPermittedAxiomBatches
+    (importedEntries : Array (Array PermittedAxiomBatch)) : PermittedAxiomMap :=
+  importedEntries.foldl (init := {}) fun state entries =>
+    entries.foldl (init := state) insertPermittedAxiomBatch
+
+private def permittedAxiomBatchHasFreshEntry
+    (state : PermittedAxiomMap)
+    (entries : PermittedAxiomBatch) : Bool :=
+  entries.any fun entry => !state.contains entry.name
+
+private def replayPermittedAxiomBatches
+    (newEntries : List PermittedAxiomBatch)
+    (_newState : PermittedAxiomMap)
+    (state : PermittedAxiomMap) : List PermittedAxiomBatch × PermittedAxiomMap :=
+  let newEntries := newEntries.filter (permittedAxiomBatchHasFreshEntry state)
+  let state := newEntries.foldl (init := state) insertPermittedAxiomBatch
+  (newEntries, state)
+
+public initialize permittedAxiomRuntimeExt : SimplePersistentEnvExtension PermittedAxiomBatch PermittedAxiomMap ←
   registerSimplePersistentEnvExtension {
     name := `temporaryAxiomPermittedRuntimeExt
-    addEntryFn := fun state entry => state.insert entry.declNameText entry
-    addImportedFn := fun importedEntries =>
-      importedEntries.foldl (init := {}) fun state entries =>
-        entries.foldl (init := state) fun state entry => state.insert entry.declNameText entry
-    replay? := some <|
-      SimplePersistentEnvExtension.replayOfFilter
-        (fun state entry => !state.contains entry.declNameText)
-        (fun state entry => state.insert entry.declNameText entry)
+    addEntryFn := insertPermittedAxiomBatch
+    addImportedFn := insertImportedPermittedAxiomBatches
+    replay? := some replayPermittedAxiomBatches
   }
+
+syntax (name := Parser.Attr.temporary_axiom_target_runtime)
+  "temporary_axiom_target_runtime" ppSpace str : attr
+
+syntax (name := Parser.Attr.temporary_axiom_permitted_runtime_batch)
+  "temporary_axiom_permitted_runtime_batch" ppSpace str : attr
+
+private def parseTargetRuntimeAttr? (stx : Syntax) : Option Name :=
+  if stx.getKind == ``Parser.Attr.temporary_axiom_target_runtime then
+    stx[1].isStrLit?.map String.toName
+  else
+    none
+
+private def parsePermittedRuntimeBatchAttr? (stx : Syntax) : Option String :=
+  if stx.getKind == ``Parser.Attr.temporary_axiom_permitted_runtime_batch then
+    stx[1].isStrLit?
+  else
+    none
+
+private def parsePermittedRuntimeBatchPayload? (payload : String) : Option PermittedAxiomBatch := Id.run do
+  let mut entries : PermittedAxiomBatch := #[]
+  if payload.isEmpty then
+    return some entries
+  for line in payload.splitOn "\n" do
+    if line.isEmpty then
+      return none
+    match line.splitOn "\t" with
+    | [declNameText, statementHashText] =>
+        let some statementHashNat := statementHashText.toNat?
+          | return none
+        entries := entries.push {
+          name := declNameText.toName
+          statementHash := statementHashNat.toUInt64
+        }
+    | _ =>
+        return none
+  return some entries
 
 public initialize targetRuntimeAttr : Unit ←
   registerBuiltinAttribute {
     name := `temporary_axiom_target_runtime
     descr := "register generated prepared-session target runtime"
-    applicationTime := AttributeApplicationTime.afterCompilation
-    add := fun declName stx _kind => do
-      Attribute.Builtin.ensureNoArgs stx
-      let some targetDeclName := parseGeneratedTargetDeclName? declName
-        | throwError m!"invalid generated prepared-session target marker {declName}"
+    applicationTime := AttributeApplicationTime.afterTypeChecking
+    add := fun _declName stx _kind => do
+      let some targetDeclName := parseTargetRuntimeAttr? stx
+        | throwError m!"invalid prepared-session target runtime attribute syntax{indentD stx}"
       modifyEnv fun env => targetRuntimeExt.addEntry env targetDeclName
     erase := fun _declName => pure ()
   }
 
-public initialize permittedRuntimeAttr : Unit ←
+public initialize permittedRuntimeBatchAttr : Unit ←
   registerBuiltinAttribute {
-    name := `temporary_axiom_permitted_runtime
-    descr := "register generated prepared-session permitted-axiom runtime"
-    applicationTime := AttributeApplicationTime.afterCompilation
-    add := fun declName stx _kind => do
-      Attribute.Builtin.ensureNoArgs stx
-      let some entry := parseGeneratedPermittedAxiom? declName
-        | throwError m!"invalid generated prepared-session permitted marker {declName}"
-      modifyEnv fun env => permittedAxiomRuntimeExt.addEntry env entry
+    name := `temporary_axiom_permitted_runtime_batch
+    descr := "register generated prepared-session permitted-axiom runtime batch"
+    applicationTime := AttributeApplicationTime.afterTypeChecking
+    add := fun _declName stx _kind => do
+      let some payload := parsePermittedRuntimeBatchAttr? stx
+        | throwError m!"invalid prepared-session permitted runtime batch attribute syntax{indentD stx}"
+      let some entries := parsePermittedRuntimeBatchPayload? payload
+        | throwError m!"invalid prepared-session permitted runtime batch payload"
+      modifyEnv fun env => permittedAxiomRuntimeExt.addEntry env entries
     erase := fun _declName => pure ()
   }
 
@@ -196,6 +196,6 @@ public def permittedAxiomMap : CoreM PermittedAxiomMap := do
   return permittedAxiomRuntimeExt.getState (← getEnv)
 
 public def permittedAxiomFor? (declName : Name) : CoreM (Option PermittedAxiom) := do
-  return (← permittedAxiomMap).get? (toString declName)
+  return (← permittedAxiomMap).find? declName
 
 end TemporaryAxiomTool.PreparedSession

@@ -320,6 +320,17 @@ def lean_name_literal(name: str) -> str:
     return f"`{name}"
 
 
+def lean_string_literal(text: str) -> str:
+    escaped = (
+        text.replace("\\", "\\\\")
+        .replace('"', '\\"')
+        .replace("\n", "\\n")
+        .replace("\t", "\\t")
+        .replace("\r", "\\r")
+    )
+    return f'"{escaped}"'
+
+
 def try_probe_decl_in_module(paths, module_name: str, decl_name: str) -> dict[str, object] | None:
     result, payloads = run_lean_probe(
         paths,
@@ -343,29 +354,12 @@ def generated_permitted_runtime_path(paths, module_name: str) -> Path:
     )
 
 
-def encode_runtime_name_component(text: str) -> str:
-    encoded_points = "_".join(str(ord(ch)) for ch in text)
-    return f"u_{encoded_points}" if encoded_points else "u_empty"
-
-
-def generated_target_marker_decl_name(target_decl: str) -> str:
-    return f"target_decl_{encode_runtime_name_component(target_decl)}"
-
-
-def generated_permitted_marker_decl_name(entry: dict[str, object]) -> str:
-    decl_name = str(entry["decl_name"])
-    statement_hash = str(entry["statement_hash"])
-    return (
-        f"permitted_decl_{encode_runtime_name_component(decl_name)}__hash_{statement_hash}"
-    )
-
-
 def generated_target_source(*, target_decl: str | None) -> str:
     body = ""
     if target_decl is not None:
         body = (
-            "@[temporary_axiom_target_runtime]\n"
-            f"public axiom {generated_target_marker_decl_name(target_decl)} : True\n"
+            f"@[temporary_axiom_target_runtime \"{target_decl}\"]\n"
+            "public axiom runtime_target_marker : True\n"
         )
     return (
         "module\n\n"
@@ -385,13 +379,10 @@ def generated_permitted_module_source(
     module_name: str,
     permitted_axioms: list[dict[str, object]],
 ) -> str:
-    entry_lines: list[str] = []
-    for entry in sorted(permitted_axioms, key=lambda item: str(item["decl_name"])):
-        entry_lines.append(
-            "@[temporary_axiom_permitted_runtime]\n"
-            f"public axiom {generated_permitted_marker_decl_name(entry)} : True"
-        )
-    permitted_payload = "\n".join(entry_lines)
+    permitted_payload = "\n".join(
+        f"{entry['decl_name']}\t{entry['statement_hash']}"
+        for entry in sorted(permitted_axioms, key=lambda item: str(item["decl_name"]))
+    )
     generated_module = generated_permitted_runtime_module_name(module_name)
     return (
         "module\n\n"
@@ -399,10 +390,11 @@ def generated_permitted_module_source(
         "Auto-generated prepared-session permitted axioms.\n"
         "This file is managed by TemporaryAxiomTool.\n"
         "-/\n"
-        f"public import {TOOL_TEMPORARY_AXIOM_MODULE}\n"
-        f"public import {TOOL_PREPARED_SESSION_TARGET_MODULE}\n\n"
+        f"public import {TOOL_PREPARED_SESSION_TARGET_MODULE}\n"
+        f"public import {TOOL_TEMPORARY_AXIOM_MODULE}\n\n"
         f"namespace {generated_module}\n\n"
-        f"{permitted_payload}\n\n"
+        f"@[temporary_axiom_permitted_runtime_batch {lean_string_literal(permitted_payload)}]\n"
+        "public axiom runtime_permitted_marker : True\n\n"
         f"end {generated_module}\n"
     )
 
