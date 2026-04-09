@@ -152,14 +152,6 @@ freeze = session["freeze"]
 - `temporary_axiom_tool_session_report.txt`
   给人读的明文报告，汇总 target、module closure 和按模块分组的 permitted temporary axioms。
 
-## 当前分支相对 `main` 的主要区别
-
-`module-sharded-session` 这条线和 `main` 的差别，主要不在 CLI 输入格式，而在 prepared runtime 的布局与 `prepare` 的默认策略：
-
-- `main` 使用单个 `TemporaryAxiomTool/PreparedSession/Generated.lean`；当前分支改为 `Target.lean` 加 `Permitted/**/*.lean` 的分模块 runtime shard。
-- `main` 的 `prepare` 默认会做一次 prepare-time hash verification，并提供 `--no-verify` 关闭；当前分支现在也保持同样的 CLI 语义，但 verify 时重写的是分 shard runtime。
-- 两边都会先用离线 axiom replay 为 permitted declarations 生成初始 axiom-side hash；当前分支的区别不在 hash 来源，而在 generated runtime 按模块分 shard 写出。
-
 ## 文档
 
 - [docs/temporary_axiom.md](docs/temporary_axiom.md)
