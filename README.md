@@ -41,6 +41,14 @@ python3 scripts/temporary_axiom_session.py prepare \
   --auto-build
 ```
 
+`prepare` 默认会在结束时立刻重建 target module，确认当前 prepared workspace 可以直接编译。若只想生成 session 而不做这次最终重建，可显式加：
+
+```bash
+python3 scripts/temporary_axiom_session.py prepare \
+  --target YourProject.Section:goal \
+  --no-verify
+```
+
 结束后清理：
 
 ```bash
@@ -97,7 +105,7 @@ freeze = session["freeze"]
 
 通过 preflight 后，`prepare` 还会继续做两类本地一致性检查：
 
-- 用 Lean probe 确认目标声明和 permitted declarations 仍能在对应模块里解析，并读取 statement hash。
+- 用 Lean probe 确认目标声明仍能解析，并读取 target statement hash；对 permitted declarations 则离线 replay 成 axiom 语义后读取 axiom-side statement hash。
 - 写完 runtime、`session.json` 和源码 managed 修改后，会立刻做一次本地 manifest 自检。
 
 这样做之后，proving agent 可以在 Lean 里继续工作，但只有这次 session 明确允许的 `sorry` 声明，才会被当作临时公理使用。
@@ -108,8 +116,10 @@ freeze = session["freeze"]
 
 这也是 `prepare` 需要插入 import 和 attribute 的原因：
 
-- `import TemporaryAxiomTool.TemporaryAxiom`
-  让当前模块加载 attribute 和运行时检查逻辑。
+- `import TemporaryAxiomTool.PreparedSession.Target`
+  让当前模块加载 frozen target runtime。
+- `import TemporaryAxiomTool.PreparedSession.Permitted.<CurrentModule>`
+  让当前模块只加载自己的 permitted runtime shard；这些 shard 自身再导入 `TemporaryAxiomTool.TemporaryAxiom`，从而拿到 attribute 和运行时检查逻辑。
 - `@[temporary_axiom]`
   只加在本次允许跳过证明的声明上，使这些声明在当前 attempt 里临时按公理处理。
 
@@ -139,6 +149,14 @@ freeze = session["freeze"]
 
 - `temporary_axiom_tool_session_report.txt`
   给人读的明文报告，汇总 target、module closure 和按模块分组的 permitted temporary axioms。
+
+## 当前分支相对 `main` 的主要区别
+
+`module-sharded-session` 这条线和 `main` 的差别，主要不在 CLI 输入格式，而在 prepared runtime 的布局与 `prepare` 的默认策略：
+
+- `main` 使用单个 `TemporaryAxiomTool/PreparedSession/Generated.lean`；当前分支改为 `Target.lean` 加 `Permitted/**/*.lean` 的分模块 runtime shard。
+- `main` 的 `prepare` 默认会做一次 prepare-time verify，并提供 `--no-verify` 关闭；当前分支现在也保持同样的 CLI 语义，但 verify 的 runtime 布局仍然是分 shard 版本。
+- 当前分支会在 `prepare` 内离线 replay permitted declarations，直接冻结 axiom-side hash；`main` 没有这套分 shard 的离线 axiom replay 布局。
 
 ## 文档
 

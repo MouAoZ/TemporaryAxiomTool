@@ -7,6 +7,12 @@
 - 快速使用见 [../README.md](../README.md)
 - 迁移说明见 [downstream_upgrade_note.md](./downstream_upgrade_note.md)
 
+当前 `module-sharded-session` 分支相对 `main` 的主要区别：
+
+- `main` 使用单个 `TemporaryAxiomTool/PreparedSession/Generated.lean`；当前分支拆成 `Target.lean` 和 `Permitted/**/*.lean`。
+- `main` 默认在 `prepare` 末尾做一次 verify，并提供 `--no-verify` 关闭；当前分支现在也保持同样的 CLI 语义，但 verify 的 runtime 布局仍然是分 shard 版本。
+- 当前分支在 `prepare` 内离线 replay permitted declarations，直接冻结 axiom-side hash。
+
 ## 1. 文件结构
 
 ```text
@@ -28,7 +34,8 @@
 │   ├── PreparedSession.lean                    # probe 命令，读取 generated runtime
 │   ├── PreparedSession/
 │   │   ├── Types.lean                          # generated runtime 使用的数据结构
-│   │   └── Generated.lean                      # 生成物：当前 session 的 target / permitted 表
+│   │   ├── Target.lean                         # 生成物：当前 session 的 frozen target runtime
+│   │   └── Permitted/                          # 生成物：按模块分片的 permitted runtime
 │   ├── StatementHash.lean                      # elaborated statement hash
 │   └── TestFixture/                            # 测试项目
 │       ├── DepA.lean
@@ -41,7 +48,8 @@
 
 说明：
 
-- `TemporaryAxiomTool/PreparedSession/Generated.lean` 是生成物；没有活动 session 时会被重置为空 runtime。
+- `TemporaryAxiomTool/PreparedSession/Target.lean` 是生成物；没有活动 session 时会被重置为空 target runtime。
+- `TemporaryAxiomTool/PreparedSession/Permitted/**/*.lean` 是生成物；只有当前 session 实际涉及 permitted axioms 的模块才会生成对应 shard。
 - `.temporary_axiom_session/prepare.lock` 是瞬时生成物；只在 `prepare` 执行期间存在。
 - `.temporary_axiom_session/session.json` 是生成物；只有 `prepare` 之后才存在。
 - `temporary_axiom_tool_session_report.txt` 也是生成物；`cleanup` 会一并删除。
@@ -55,6 +63,7 @@ python3 scripts/temporary_axiom_session.py prepare --target MyProj.Mod:goal
 python3 scripts/temporary_axiom_session.py prepare --target MyProj.Mod:My.Namespace.goal
 python3 scripts/temporary_axiom_session.py prepare --target MyProj.Mod.goal
 python3 scripts/temporary_axiom_session.py prepare --target MyProj.Mod:goal --auto-build
+python3 scripts/temporary_axiom_session.py prepare --target MyProj.Mod:goal --no-verify
 python3 scripts/temporary_axiom_session.py cleanup
 ```
 
@@ -80,13 +89,13 @@ python3 scripts/temporary_axiom_session.py cleanup
 
 - `.temporary_axiom_session/session.json`
 - `temporary_axiom_tool_session_report.txt`
-- `TemporaryAxiomTool/PreparedSession/Generated.lean`
+- `TemporaryAxiomTool/PreparedSession/Target.lean` 与 `TemporaryAxiomTool/PreparedSession/Permitted/**/*.lean`
 
 `session.json` 的稳定结构是：
 
 ```json
 {
-  "schema_version": 2,
+  "schema_version": 3,
   "base_commit": "optional git sha",
   "freeze": {
     "target": {
@@ -106,7 +115,16 @@ python3 scripts/temporary_axiom_session.py cleanup
   },
   "cleanup": {
     "edits": {
-      "imports": [],
+      "imports": [
+        {
+          "file": "MyProj/Mod.lean",
+          "module": "TemporaryAxiomTool.PreparedSession.Target"
+        },
+        {
+          "file": "MyProj/Mod.lean",
+          "module": "TemporaryAxiomTool.PreparedSession.Permitted.MyProj.Mod"
+        }
+      ],
       "attributes": []
     }
   }
@@ -154,6 +172,8 @@ python3 scripts/temporary_axiom_session.py cleanup
   - `<fully-qualified-decl>`
 - `--base-commit <sha>` 可选；默认取当前 `HEAD`
 - `--auto-build` 可选；显式允许 `prepare` 在发现模块产物缺失或与当前源码不同步时先补构建
+- 默认会在写完 generated runtime shard 和源码 managed 修改后，立即重建 target module 做最终确认
+- `--no-verify` 可选；显式跳过这次最终 target-module rebuild
 
 流程：
 
@@ -167,19 +187,20 @@ python3 scripts/temporary_axiom_session.py cleanup
 6. 先做模块级预筛：只继续扫描源码里可能同时出现 `theorem` 与显式 `sorry` 的模块；这一步也会忽略旧 tool-managed 残留。
 7. 对保留下来的模块读取 `.ilean` 的 `decls`。
 8. 只对源码头部是 `theorem` 的声明，在 declaration 自己的源码 range 内检查是否显式出现 `sorry`。
-9. 对目标声明和命中的 declaration 做 Lean probe，读取 statement hash。
-10. 写出 `Generated.lean` 与 `session.json`。
-11. 写出 `temporary_axiom_tool_session_report.txt`。
-12. 只在本次确实需要打标记的源码文件里修改源码：没有现成 attr block 的声明会插入独立的 managed `@[temporary_axiom]` 行；已有 attr block 的声明会把 `temporary_axiom` 合并进原 block，并带上可清理的 managed 标记。如果声明头里本来就有 `temporary_axiom`，则直接复用，不重复插入。
-13. 立即用 `session.json`、generated runtime 和本次 edit log 做一次本地一致性自检。
-14. 删除 `prepare.lock`。
+9. 对目标声明做 Lean probe，读取 target 的 statement hash；对命中的 permitted declaration 做离线 axiom replay，读取 axiom-side statement hash。
+10. 写出 `TemporaryAxiomTool/PreparedSession/Target.lean` 和按模块分组的 `TemporaryAxiomTool/PreparedSession/Permitted/**/*.lean`。
+11. 只在本次确实需要打标记的源码文件里修改源码：每个文件会直接插入 `TemporaryAxiomTool.PreparedSession.Target`，以及该文件所属模块对应的 permitted shard import。没有现成 attr block 的声明会插入独立的 managed `@[temporary_axiom]` 行；已有 attr block 的声明会把 `temporary_axiom` 合并进原 block，并带上可清理的 managed 标记。如果声明头里本来就有 `temporary_axiom`，则直接复用，不重复插入。
+12. 默认会重建 target module 做最终确认；若显式给出 `--no-verify`，则跳过这一步。即使 verify 打开，只要 permitted 集合为空，也会安全跳过这次最终重建，因为当前 prepared workspace 不会注册任何 permitted temporary axioms。
+13. 写出 `session.json` 与 `temporary_axiom_tool_session_report.txt`。
+14. 立即用 `session.json`、generated target / permitted shard 和本次 edit log 做一次本地一致性自检。
+15. 删除 `prepare.lock`。
 
 当前 permitted 集合只包含两类声明：
 
 - target 同模块且位于 target 之前的显式 `sorry` theorem 声明
 - target 依赖模块中的显式 `sorry` theorem 声明
 
-这里之所以要改源码，是因为运行时检查发生在 Lean elaboration 里：只有 import 了 `TemporaryAxiomTool.TemporaryAxiom`，并且真实给声明加上 `@[temporary_axiom]`，这些声明才会在当前 attempt 中按“受检查的临时公理”工作。
+这里之所以要改源码，是因为运行时检查发生在 Lean elaboration 里：项目源码文件需要真实 import `TemporaryAxiomTool.PreparedSession.Target` 与本模块对应的 permitted shard，并且真实给声明加上 `@[temporary_axiom]`，这些声明才会在当前 attempt 中按“受检查的临时公理”工作。permitted shard 自身再导入 `TemporaryAxiomTool.TemporaryAxiom`，从而拿到 attribute 与运行时检查逻辑。
 
 `prepare` 的命令行输出会额外给出：
 
@@ -190,7 +211,7 @@ python3 scripts/temporary_axiom_session.py cleanup
 
 活动 session 的一致性检查只读取两类信息：
 
-- `session.json` / `Generated.lean`
+- `session.json` / generated target + permitted shard
 - 当前活动 session 的 `cleanup.edits` 里列出的源码文件
 
 这些检查都是局部检查，不引入新的全仓库扫描。
@@ -211,7 +232,7 @@ python3 scripts/temporary_axiom_session.py cleanup
 
 1. 删除 managed import
 2. 删除或还原 managed `@[temporary_axiom]`
-3. 重置 `TemporaryAxiomTool/PreparedSession/Generated.lean`
+3. 重置 `TemporaryAxiomTool/PreparedSession/Target.lean`，并删除 `TemporaryAxiomTool/PreparedSession/Permitted/**/*.lean`
 4. 删除 `.temporary_axiom_session/session.json`
 5. 删除 `temporary_axiom_tool_session_report.txt`
 6. 尝试移除空的 `.temporary_axiom_session/`

@@ -396,7 +396,7 @@ def print_prepare_summary(
     elif verification_status == "skipped_no_permitted_axioms":
         print("- final target-module verification: skipped because no permitted temporary axioms were registered")
     else:
-        print("- final target-module verification: skipped by default; use `prepare --verify` to enable it")
+        print("- final target-module verification: skipped by `--no-verify`")
     print(f"- session data: {relative_path_str(paths.project_root, paths.session_file)}")
     print(f"- human-readable report: {relative_path_str(paths.project_root, paths.report_file)}")
 
@@ -2179,7 +2179,7 @@ def prepare_session(args: argparse.Namespace, paths) -> None:
         except Exception:
             reset_generated_runtime(paths)
             raise
-        verification_status = "skipped_default"
+        verification_status = "skipped_disabled"
         try:
             if args.verify:
                 if permitted_axioms:
@@ -2308,10 +2308,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="Automatically refresh stale or missing module artifacts before resolving the target.",
     )
     prepare.add_argument(
-        "--verify",
-        action="store_true",
-        help="After prepare writes runtime shards and managed edits, rebuild the target module once to confirm the prepared workspace immediately.",
+        "--no-verify",
+        dest="verify",
+        action="store_false",
+        help="Skip the final target-module rebuild during prepare. The prepared workspace may still surface errors on the next `lake build`.",
     )
+    prepare.set_defaults(verify=True)
 
     subparsers.add_parser("cleanup", help="Remove the active session's managed edits and generated files.")
     return parser
