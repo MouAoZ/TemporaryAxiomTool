@@ -41,6 +41,14 @@ python3 scripts/temporary_axiom_session.py prepare \
   --auto-build
 ```
 
+`prepare` 默认还会在结束前做一次 prepare-time temporary-axiom hash verification，确认冻结下来的 permitted hashes 与当前 elaboration 一致。若只想先生成 session、把这轮校验留给后续 `lake build`，可显式加：
+
+```bash
+python3 scripts/temporary_axiom_session.py prepare \
+  --target YourProject.Section:goal \
+  --no-verify
+```
+
 结束后清理：
 
 ```bash
@@ -65,6 +73,7 @@ freeze = session["freeze"]
 - 冻结这次尝试要使用的信息：target theorem、module closure、允许临时公理化的声明及其 statement hash。
 - 生成 Lean 侧 runtime：把冻结结果写入 `TemporaryAxiomTool/PreparedSession/Generated.lean`。
 - 对源码做受控修改：预检和源码扫描会忽略上一次没清干净的 tool-managed 残留；真正落盘时，只修改这次确实需要打标记的源码文件。没有现成 attr block 的声明会插入独立的 managed `@[temporary_axiom]` 行；已有 attr block 的声明会把 `temporary_axiom` 合并进原 block。
+- 默认再做一轮 prepare-time hash verification；`--no-verify` 会跳过这一步，改为信任 `prepare` 阶段离线 replay 得到的 frozen hash。
 
 `prepare` 完成后，还会给用户输出一份摘要：
 
@@ -95,9 +104,10 @@ freeze = session["freeze"]
 - 检查当前源码 import 头是否仍与 `.ilean` 记录一致。
 - 检查当前源码文本哈希是否仍与 Lake `.trace` 记录一致。
 
-通过 preflight 后，`prepare` 还会继续做两类本地一致性检查：
+通过 preflight 后，`prepare` 还会继续做几类本地一致性检查：
 
-- 用 Lean probe 确认目标声明和 permitted declarations 仍能在对应模块里解析，并读取 statement hash。
+- 用 Lean probe 确认目标声明仍能在对应模块里解析，并读取 target statement hash；对 permitted declarations 则按 axiom 语义做离线 replay，冻结 axiom-side statement hash。
+- 默认在写完 runtime 和源码 managed 修改后做一次 prepare-time hash verification；显式给 `--no-verify` 时跳过这一步。
 - 写完 runtime、`session.json` 和源码 managed 修改后，会立刻做一次本地 manifest 自检。
 
 这样做之后，proving agent 可以在 Lean 里继续工作，但只有这次 session 明确允许的 `sorry` 声明，才会被当作临时公理使用。

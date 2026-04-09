@@ -55,6 +55,7 @@ python3 scripts/temporary_axiom_session.py prepare --target MyProj.Mod:goal
 python3 scripts/temporary_axiom_session.py prepare --target MyProj.Mod:My.Namespace.goal
 python3 scripts/temporary_axiom_session.py prepare --target MyProj.Mod.goal
 python3 scripts/temporary_axiom_session.py prepare --target MyProj.Mod:goal --auto-build
+python3 scripts/temporary_axiom_session.py prepare --target MyProj.Mod:goal --no-verify
 python3 scripts/temporary_axiom_session.py cleanup
 ```
 
@@ -154,6 +155,8 @@ python3 scripts/temporary_axiom_session.py cleanup
   - `<fully-qualified-decl>`
 - `--base-commit <sha>` 可选；默认取当前 `HEAD`
 - `--auto-build` 可选；显式允许 `prepare` 在发现模块产物缺失或与当前源码不同步时先补构建
+- 默认会在写完 generated runtime 和源码 managed 修改后，做一次 prepare-time temporary-axiom hash verification
+- `--no-verify` 可选；显式跳过这次 prepare-time hash verification，直接信任离线 replay 冻结出的 hash
 
 流程：
 
@@ -167,12 +170,13 @@ python3 scripts/temporary_axiom_session.py cleanup
 6. 先做模块级预筛：只继续扫描源码里可能同时出现 `theorem` 与显式 `sorry` 的模块；这一步也会忽略旧 tool-managed 残留。
 7. 对保留下来的模块读取 `.ilean` 的 `decls`。
 8. 只对源码头部是 `theorem` 的声明，在 declaration 自己的源码 range 内检查是否显式出现 `sorry`。
-9. 对目标声明和命中的 declaration 做 Lean probe，读取 statement hash。
-10. 写出 `Generated.lean` 与 `session.json`。
-11. 写出 `temporary_axiom_tool_session_report.txt`。
-12. 只在本次确实需要打标记的源码文件里修改源码：没有现成 attr block 的声明会插入独立的 managed `@[temporary_axiom]` 行；已有 attr block 的声明会把 `temporary_axiom` 合并进原 block，并带上可清理的 managed 标记。如果声明头里本来就有 `temporary_axiom`，则直接复用，不重复插入。
-13. 立即用 `session.json`、generated runtime 和本次 edit log 做一次本地一致性自检。
-14. 删除 `prepare.lock`。
+9. 对目标声明做 Lean probe，读取 target statement hash；对命中的 permitted declaration 则按 axiom 语义做离线 replay，冻结 axiom-side statement hash。
+10. 写出 `Generated.lean`。
+11. 只在本次确实需要打标记的源码文件里修改源码：没有现成 attr block 的声明会插入独立的 managed `@[temporary_axiom]` 行；已有 attr block 的声明会把 `temporary_axiom` 合并进原 block，并带上可清理的 managed 标记。如果声明头里本来就有 `temporary_axiom`，则直接复用，不重复插入。
+12. 默认会做一次 prepare-time temporary-axiom hash verification；若显式给出 `--no-verify`，则跳过这一步，把离线 replay 的冻结 hash 留给后续 `lake build` 使用。
+13. 写出 `session.json` 与 `temporary_axiom_tool_session_report.txt`。
+14. 立即用 `session.json`、generated runtime 和本次 edit log 做一次本地一致性自检。
+15. 删除 `prepare.lock`。
 
 当前 permitted 集合只包含两类声明：
 
