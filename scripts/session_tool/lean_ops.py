@@ -1,16 +1,18 @@
 from __future__ import annotations
 
 import json
+import os
 import shlex
+import shutil
 import subprocess
 import tempfile
+from functools import lru_cache
 from pathlib import Path
 
 from .common import (
     TOOL_NAMESPACE,
     TOOL_PREPARED_SESSION_MODULE,
     TOOL_PREPARED_SESSION_PERMITTED_MODULE_PREFIX,
-    TOOL_PREPARED_SESSION_TARGET_MODULE,
     TOOL_PREPARED_SESSION_TYPES_MODULE,
     TOOL_TEMPORARY_AXIOM_MODULE,
     ensure_layout,
@@ -25,6 +27,7 @@ def run_command(
     description: str,
     *,
     allow_failure: bool = False,
+    env: dict[str, str] | None = None,
 ) -> subprocess.CompletedProcess[str]:
     try:
         result = subprocess.run(
@@ -33,6 +36,7 @@ def run_command(
             text=True,
             capture_output=True,
             check=False,
+            env=env,
         )
     except FileNotFoundError as exc:
         fail(
@@ -90,6 +94,25 @@ def main (args : List String) : IO UInt32 := do
 """
 
 
+@lru_cache(maxsize=None)
+def lean_command_configuration(paths) -> tuple[tuple[str, ...], dict[str, str] | None]:
+    lean_executable = shutil.which("lean")
+    if lean_executable is None:
+        return ("lake", "env", "lean"), None
+    result = run_command(
+        paths,
+        ["lake", "env", "printenv", "LEAN_PATH"],
+        "读取 LEAN_PATH",
+        allow_failure=True,
+    )
+    lean_path = result.stdout.strip() if result.returncode == 0 else ""
+    if not lean_path:
+        return ("lake", "env", "lean"), None
+    env = dict(os.environ)
+    env["LEAN_PATH"] = lean_path
+    return (lean_executable,), env
+
+
 def module_artifact_path(paths, module_name: str, suffix: str) -> Path:
     return paths.lean_build_lib_root / module_name_to_relative_path(module_name).with_suffix(suffix)
 
@@ -129,15 +152,7 @@ def trace_source_hash(trace_path: Path, *, source_path: Path, relative_source_su
     return None
 
 
-def compute_text_file_hashes(paths, file_paths: list[Path]) -> dict[Path, str]:
-    resolved_paths: list[Path] = []
-    seen: set[Path] = set()
-    for path in file_paths:
-        resolved = path.resolve()
-        if resolved in seen:
-            continue
-        seen.add(resolved)
-        resolved_paths.append(resolved)
+def compute_text_hashes_for_resolved_paths(paths, resolved_paths: list[Path]) -> dict[Path, str]:
     if not resolved_paths:
         return {}
     with tempfile.NamedTemporaryFile(
@@ -150,11 +165,13 @@ def compute_text_file_hashes(paths, file_paths: list[Path]) -> dict[Path, str]:
     ) as handle:
         handle.write(TEXT_HASH_RUNNER_SOURCE)
         temp_path = Path(handle.name)
+    lean_cmd, lean_env = lean_command_configuration(paths)
     try:
         result = run_command(
             paths,
-            ["lake", "env", "lean", "--run", str(temp_path), *[str(path) for path in resolved_paths]],
+            [*lean_cmd, "--run", str(temp_path), *[str(path) for path in resolved_paths]],
             "计算源码文本哈希",
+            env=lean_env,
         )
     finally:
         temp_path.unlink(missing_ok=True)
@@ -180,36 +197,52 @@ def compute_text_file_hashes(paths, file_paths: list[Path]) -> dict[Path, str]:
     return hashes
 
 
-def compute_text_hashes_for_texts(paths, texts_by_path: dict[Path, str]) -> dict[Path, str]:
-    resolved_items: list[tuple[Path, str]] = []
-    seen: set[Path] = set()
-    for path, text in texts_by_path.items():
+def compute_text_hashes(
+    paths,
+    *,
+    file_paths: list[Path] | None = None,
+    texts_by_path: dict[Path, str] | None = None,
+) -> dict[Path, str]:
+    resolved_paths: list[Path] = []
+    resolved_text_items: list[tuple[Path, str]] = []
+    seen_raw: set[Path] = set()
+    seen_text: set[Path] = set()
+    for path in file_paths or []:
         resolved = path.resolve()
-        if resolved in seen:
+        if resolved in seen_raw:
             continue
-        seen.add(resolved)
-        resolved_items.append((resolved, text))
-    if not resolved_items:
+        seen_raw.add(resolved)
+        resolved_paths.append(resolved)
+    for path, text in (texts_by_path or {}).items():
+        resolved = path.resolve()
+        if resolved in seen_text:
+            continue
+        seen_text.add(resolved)
+        resolved_text_items.append((resolved, text))
+    if not resolved_paths and not resolved_text_items:
         return {}
     with tempfile.TemporaryDirectory(
         prefix="TemporaryAxiomToolNormalizedHash_",
         dir=paths.project_root,
     ) as temp_dir_name:
         temp_dir = Path(temp_dir_name)
-        temp_paths: list[Path] = []
         original_by_temp: dict[Path, Path] = {}
-        for idx, (original_path, text) in enumerate(resolved_items):
+        hash_inputs = list(resolved_paths)
+        for idx, (original_path, text) in enumerate(resolved_text_items):
             temp_path = temp_dir / f"normalized_{idx}.lean"
             temp_path.write_text(text, encoding="utf-8")
-            temp_paths.append(temp_path)
-            original_by_temp[temp_path.resolve()] = original_path
-        raw_hashes = compute_text_file_hashes(paths, temp_paths)
+            temp_resolved = temp_path.resolve()
+            original_by_temp[temp_resolved] = original_path
+            hash_inputs.append(temp_resolved)
+        raw_hashes = compute_text_hashes_for_resolved_paths(paths, hash_inputs)
     hashes: dict[Path, str] = {}
-    for temp_path, hash_value in raw_hashes.items():
-        original_path = original_by_temp.get(temp_path.resolve())
+    for path, hash_value in raw_hashes.items():
+        original_path = original_by_temp.get(path)
         if original_path is not None:
             hashes[original_path] = hash_value
-    missing_paths = [str(path) for path, _ in resolved_items if path not in hashes]
+        else:
+            hashes[path] = hash_value
+    missing_paths = [str(path) for path, _ in resolved_text_items if path not in hashes]
     if missing_paths:
         preview = missing_paths[:10]
         details = [
@@ -223,6 +256,14 @@ def compute_text_hashes_for_texts(paths, texts_by_path: dict[Path, str]) -> dict
             details=details,
         )
     return hashes
+
+
+def compute_text_file_hashes(paths, file_paths: list[Path]) -> dict[Path, str]:
+    return compute_text_hashes(paths, file_paths=file_paths)
+
+
+def compute_text_hashes_for_texts(paths, texts_by_path: dict[Path, str]) -> dict[Path, str]:
+    return compute_text_hashes(paths, texts_by_path=texts_by_path)
 
 
 def ensure_probe_tool_ready(paths) -> None:
@@ -277,12 +318,14 @@ def run_lean_source(
     ) as handle:
         handle.write(source)
         temp_path = Path(handle.name)
+    lean_cmd, lean_env = lean_command_configuration(paths)
     try:
         result = run_command(
             paths,
-            ["lake", "env", "lean", str(temp_path)],
+            [*lean_cmd, str(temp_path)],
             description,
             allow_failure=allow_failure,
+            env=lean_env,
         )
     finally:
         temp_path.unlink(missing_ok=True)
@@ -390,7 +433,6 @@ def generated_permitted_module_source(
         "Auto-generated prepared-session permitted axioms.\n"
         "This file is managed by TemporaryAxiomTool.\n"
         "-/\n"
-        f"public import {TOOL_PREPARED_SESSION_TARGET_MODULE}\n"
         f"public import {TOOL_TEMPORARY_AXIOM_MODULE}\n\n"
         f"namespace {generated_module}\n\n"
         f"@[temporary_axiom_permitted_runtime_batch {lean_string_literal(permitted_payload)}]\n"

@@ -29,8 +29,7 @@ from .common import (
 )
 from .lean_ops import (
     build_module,
-    compute_text_file_hashes,
-    compute_text_hashes_for_texts,
+    compute_text_hashes,
     ensure_probe_tool_ready,
     generated_permitted_runtime_module_name,
     generated_session_sources,
@@ -367,7 +366,7 @@ def print_prepare_summary(
     target_info: dict[str, object],
     module_closure: list[str],
     grouped_permitted_axioms: dict[str, list[dict[str, str]]],
-    verified: bool,
+    verification_status: str,
 ) -> None:
     permitted_count = sum(len(entries) for entries in grouped_permitted_axioms.values())
     involved_modules_count = len(module_closure)
@@ -392,8 +391,10 @@ def print_prepare_summary(
                     print(f"    - {entry['decl_name']}")
     else:
         print("- permitted temporary axiom list is long; see the saved report for the full grouped list.")
-    if verified:
+    if verification_status == "completed":
         print("- final target-module verification: completed during prepare")
+    elif verification_status == "skipped_no_permitted_axioms":
+        print("- final target-module verification: skipped because no permitted temporary axioms were registered")
     else:
         print("- final target-module verification: skipped by default; use `prepare --verify` to enable it")
     print(f"- session data: {relative_path_str(paths.project_root, paths.session_file)}")
@@ -626,8 +627,11 @@ def collect_artifact_issue_map(
             normalized_hash_texts[source_path] = normalized_text
         else:
             raw_hash_paths.append(source_path)
-    current_source_hashes = compute_text_file_hashes(paths, raw_hash_paths)
-    current_source_hashes.update(compute_text_hashes_for_texts(paths, normalized_hash_texts))
+    current_source_hashes = compute_text_hashes(
+        paths,
+        file_paths=raw_hash_paths,
+        texts_by_path=normalized_hash_texts,
+    )
     for current_module in modules_requiring_hash_check:
         source_path = module_name_to_path(paths.project_root, current_module).resolve()
         current_hash = current_source_hashes.get(source_path)
@@ -2175,13 +2179,22 @@ def prepare_session(args: argparse.Namespace, paths) -> None:
         except Exception:
             reset_generated_runtime(paths)
             raise
+        verification_status = "skipped_default"
         try:
             if args.verify:
-                print(
-                    f"Verifying prepared workspace by rebuilding `{target_info['module']}`...",
-                    flush=True,
-                )
-                build_prepared_target_module(paths, target_module=str(target_info["module"]))
+                if permitted_axioms:
+                    print(
+                        f"Verifying prepared workspace by rebuilding `{target_info['module']}`...",
+                        flush=True,
+                    )
+                    build_prepared_target_module(paths, target_module=str(target_info["module"]))
+                    verification_status = "completed"
+                else:
+                    print(
+                        "Skipping prepare-time target rebuild because no permitted temporary axioms were registered.",
+                        flush=True,
+                    )
+                    verification_status = "skipped_no_permitted_axioms"
             session_payload = {
                 "schema_version": 3,
                 "base_commit": base_commit,
@@ -2224,7 +2237,7 @@ def prepare_session(args: argparse.Namespace, paths) -> None:
             target_info=target_info,
             module_closure=module_closure,
             grouped_permitted_axioms=grouped_permitted_axioms,
-            verified=args.verify,
+            verification_status=verification_status,
         )
     finally:
         release_prepare_lock(paths)
