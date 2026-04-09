@@ -10,7 +10,7 @@
 当前 `module-sharded-session` 分支相对 `main` 的主要区别：
 
 - `main` 使用单个 `TemporaryAxiomTool/PreparedSession/Generated.lean`；当前分支拆成 `Target.lean` 和 `Permitted/**/*.lean`。
-- `main` 默认在 `prepare` 末尾做一次 verify，并提供 `--no-verify` 关闭；当前分支现在也保持同样的 CLI 语义，但 verify 的 runtime 布局仍然是分 shard 版本。
+- `main` 默认在 `prepare` 末尾做一次 prepare-time hash verification，并提供 `--no-verify` 关闭；当前分支现在也保持同样的 CLI 语义，但 verify 的 runtime 布局仍然是分 shard 版本。
 - 当前分支在 `prepare` 内离线 replay permitted declarations，直接冻结 axiom-side hash。
 
 ## 1. 文件结构
@@ -172,8 +172,8 @@ python3 scripts/temporary_axiom_session.py cleanup
   - `<fully-qualified-decl>`
 - `--base-commit <sha>` 可选；默认取当前 `HEAD`
 - `--auto-build` 可选；显式允许 `prepare` 在发现模块产物缺失或与当前源码不同步时先补构建
-- 默认会在写完 generated runtime shard 和源码 managed 修改后，立即重建 target module 做最终确认
-- `--no-verify` 可选；显式跳过这次最终 target-module rebuild
+- 默认会在写完 generated runtime shard 和源码 managed 修改后，做一次 prepare-time temporary-axiom hash verification
+- `--no-verify` 可选；显式跳过这次 prepare-time hash verification，直接信任离线 replay 冻结出的 hash
 
 流程：
 
@@ -190,7 +190,7 @@ python3 scripts/temporary_axiom_session.py cleanup
 9. 对目标声明做 Lean probe，读取 target 的 statement hash；对命中的 permitted declaration 做离线 axiom replay，读取 axiom-side statement hash。
 10. 写出 `TemporaryAxiomTool/PreparedSession/Target.lean` 和按模块分组的 `TemporaryAxiomTool/PreparedSession/Permitted/**/*.lean`。
 11. 只在本次确实需要打标记的源码文件里修改源码：每个文件会直接插入 `TemporaryAxiomTool.PreparedSession.Target`，以及该文件所属模块对应的 permitted shard import。没有现成 attr block 的声明会插入独立的 managed `@[temporary_axiom]` 行；已有 attr block 的声明会把 `temporary_axiom` 合并进原 block，并带上可清理的 managed 标记。如果声明头里本来就有 `temporary_axiom`，则直接复用，不重复插入。
-12. 默认会重建 target module 做最终确认；若显式给出 `--no-verify`，则跳过这一步。即使 verify 打开，只要 permitted 集合为空，也会安全跳过这次最终重建，因为当前 prepared workspace 不会注册任何 permitted temporary axioms。
+12. 默认会做一次 prepare-time temporary-axiom hash verification：按依赖顺序对含 permitted axioms 的模块做真实 `lake build`，若出现 mismatch，则从 Lean 报错中回填实际 elaborated hash 并重写对应 runtime shard；若显式给出 `--no-verify`，则跳过这一步。即使 verify 打开，只要 permitted 集合为空，也会安全跳过这次校验，因为当前 prepared workspace 不会注册任何 permitted temporary axioms。
 13. 写出 `session.json` 与 `temporary_axiom_tool_session_report.txt`。
 14. 立即用 `session.json`、generated target / permitted shard 和本次 edit log 做一次本地一致性自检。
 15. 删除 `prepare.lock`。

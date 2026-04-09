@@ -46,6 +46,12 @@ from .lean_ops import (
 SORRY_TOKEN_RE = re.compile(r"(?<![A-Za-z0-9_'])sorry(?![A-Za-z0-9_'])")
 LEAN_IDENT_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_']*")
 THEOREM_TOKEN_RE = re.compile(r"(?<![A-Za-z0-9_'])theorem(?![A-Za-z0-9_'])")
+TEMP_AXIOM_HASH_MISMATCH_RE = re.compile(
+    r"Invalid @\[temporary_axiom\] target (?P<decl>[^\n]+)\n\n"
+    r"The frozen prepared-session entry does not match the elaborated statement\.\n\n"
+    r"Expected hash: (?P<expected>\d+)\n\n"
+    r"Actual hash:\s+(?P<actual>\d+)"
+)
 INLINE_MODULE_LIST_LIMIT = 10
 INLINE_PERMITTED_AXIOM_LIMIT = 12
 DECL_MODIFIER_TOKENS = {
@@ -392,11 +398,11 @@ def print_prepare_summary(
     else:
         print("- permitted temporary axiom list is long; see the saved report for the full grouped list.")
     if verification_status == "completed":
-        print("- final target-module verification: completed during prepare")
+        print("- hash verification: completed during prepare")
     elif verification_status == "skipped_no_permitted_axioms":
-        print("- final target-module verification: skipped because no permitted temporary axioms were registered")
+        print("- hash verification: skipped because no permitted temporary axioms were registered")
     else:
-        print("- final target-module verification: skipped by `--no-verify`")
+        print("- hash verification: skipped by `--no-verify`; later `lake build` may still expose mismatch")
     print(f"- session data: {relative_path_str(paths.project_root, paths.session_file)}")
     print(f"- human-readable report: {relative_path_str(paths.project_root, paths.report_file)}")
 
@@ -976,6 +982,34 @@ def compute_module_closure(paths, target_module: str) -> list[str]:
     return ordered
 
 
+def dependency_first_module_order(paths, modules: list[str]) -> list[str]:
+    module_set = set(modules)
+    visiting: set[str] = set()
+    visited: set[str] = set()
+    ordered: list[str] = []
+
+    def visit(module_name: str) -> None:
+        if module_name in visited:
+            return
+        if module_name in visiting:
+            fail(
+                "模块依赖图存在循环，无法为 `verify` 计算稳定的构建顺序。",
+                details=[f"涉及模块：`{module_name}`"],
+            )
+        visiting.add(module_name)
+        metadata = load_ilean_metadata(paths, module_name)
+        for imported in direct_host_imports_from_metadata(paths, metadata):
+            if imported in module_set:
+                visit(imported)
+        visiting.remove(module_name)
+        visited.add(module_name)
+        ordered.append(module_name)
+
+    for module_name in modules:
+        visit(module_name)
+    return ordered
+
+
 def build_axiom_probe_source(
     *,
     prefix_source: str,
@@ -1359,11 +1393,154 @@ def collect_permitted_axioms(
     return closure, permitted_axioms
 
 
-def build_prepared_target_module(paths, *, target_module: str) -> None:
-    run_command(
+def resolve_mismatch_decl_name(
+    module_entries: list[dict[str, object]],
+    raw_decl_name: str,
+) -> str | None:
+    exact_matches = [
+        str(entry["decl_name"]) for entry in module_entries if str(entry["decl_name"]) == raw_decl_name
+    ]
+    if len(exact_matches) == 1:
+        return exact_matches[0]
+    short_matches = [
+        str(entry["decl_name"])
+        for entry in module_entries
+        if short_decl_name(str(entry["decl_name"])) == raw_decl_name
+    ]
+    if len(short_matches) == 1:
+        return short_matches[0]
+    suffix_matches = [
+        str(entry["decl_name"])
+        for entry in module_entries
+        if str(entry["decl_name"]).endswith("." + raw_decl_name)
+    ]
+    if len(suffix_matches) == 1:
+        return suffix_matches[0]
+    return None
+
+
+def parse_temporary_axiom_hash_mismatches(
+    output: str,
+    *,
+    module_entries: list[dict[str, object]],
+) -> dict[str, str]:
+    resolved: dict[str, str] = {}
+    for match in TEMP_AXIOM_HASH_MISMATCH_RE.finditer(output):
+        raw_decl_name = match.group("decl").strip()
+        full_decl_name = resolve_mismatch_decl_name(module_entries, raw_decl_name)
+        if full_decl_name is None:
+            continue
+        resolved[full_decl_name] = match.group("actual")
+    return resolved
+
+
+def verify_prepared_axiom_hashes(
+    paths,
+    *,
+    target_decl: str,
+    target_module: str,
+    module_closure: list[str],
+    permitted_axioms: list[dict[str, object]],
+) -> None:
+    if not permitted_axioms:
+        return
+    grouped: dict[str, list[dict[str, object]]] = defaultdict(list)
+    for entry in permitted_axioms:
+        grouped[str(entry["module"])].append(entry)
+    module_order = [
+        module_name
+        for module_name in dependency_first_module_order(paths, module_closure)
+        if module_name in grouped
+    ]
+    changed_any = False
+    target_built_with_latest_runtime = False
+    for module_name in module_order:
+        module_entries = grouped[module_name]
+        result = run_command(
+            paths,
+            ["lake", "build", module_name],
+            f"校验 `{module_name}` 中 temporary axioms 的 statement hash",
+            allow_failure=True,
+        )
+        if result.returncode == 0:
+            if module_name == target_module:
+                target_built_with_latest_runtime = True
+            continue
+        output = "\n".join(part for part in [result.stdout.strip(), result.stderr.strip()] if part)
+        mismatches = parse_temporary_axiom_hash_mismatches(
+            output,
+            module_entries=module_entries,
+        )
+        if not mismatches:
+            fail(
+                "prepare 阶段校验 temporary axioms 时构建失败。",
+                details=[
+                    f"模块：`{module_name}`",
+                    f"命令：`lake build {module_name}`",
+                    "输出：\n" + (output or "<空>"),
+                ],
+                hints=[
+                    "先检查该模块是否存在与 temporary axioms 无关的编译错误。",
+                ],
+            )
+        module_changed = False
+        for entry in module_entries:
+            decl_name = str(entry["decl_name"])
+            actual_hash = mismatches.get(decl_name)
+            if actual_hash is None:
+                continue
+            if str(entry["statement_hash"]) != actual_hash:
+                entry["statement_hash"] = actual_hash
+                module_changed = True
+        if not module_changed:
+            fail(
+                "prepare 阶段拿到了 hash mismatch，但没有产生新的 hash 更新。",
+                details=[
+                    f"模块：`{module_name}`",
+                    "输出：\n" + (output or "<空>"),
+                ],
+                hints=[
+                    "这通常说明 mismatch 解析结果和当前 generated runtime 已经不一致。",
+                ],
+            )
+        write_generated_runtime(
+            paths,
+            target_decl=target_decl,
+            permitted_axioms=permitted_axioms,
+        )
+        changed_any = True
+        target_built_with_latest_runtime = False
+    if not changed_any or target_built_with_latest_runtime:
+        return
+    result = run_command(
         paths,
         ["lake", "build", target_module],
-        f"完成 prepared session 后重建 `{target_module}`",
+        f"确认更新 hash 后 `{target_module}` 可以重新构建",
+        allow_failure=True,
+    )
+    if result.returncode == 0:
+        return
+    output = "\n".join(part for part in [result.stdout.strip(), result.stderr.strip()] if part)
+    if "The frozen prepared-session entry does not match the elaborated statement." in output:
+        fail(
+            "单轮 `verify` 更新 hash 后，target 模块里仍然存在 temporary axiom hash mismatch。",
+            details=[
+                f"目标模块：`{target_module}`",
+                "输出：\n" + (output or "<空>"),
+            ],
+            hints=[
+                "这说明至少有一个模块的一次构建没有暴露全部 mismatch，需要进一步分析该模块的报错行为。",
+            ],
+        )
+    fail(
+        "prepare 阶段在完成 hash 更新后，target 模块仍然构建失败。",
+        details=[
+            f"目标模块：`{target_module}`",
+            "输出：\n" + (output or "<空>"),
+        ],
+        hints=[
+            "先检查该失败是否与 temporary axioms 无关。",
+        ],
     )
 
 
@@ -2181,20 +2358,22 @@ def prepare_session(args: argparse.Namespace, paths) -> None:
             raise
         verification_status = "skipped_disabled"
         try:
-            if args.verify:
-                if permitted_axioms:
-                    print(
-                        f"Verifying prepared workspace by rebuilding `{target_info['module']}`...",
-                        flush=True,
-                    )
-                    build_prepared_target_module(paths, target_module=str(target_info["module"]))
-                    verification_status = "completed"
-                else:
-                    print(
-                        "Skipping prepare-time target rebuild because no permitted temporary axioms were registered.",
-                        flush=True,
-                    )
-                    verification_status = "skipped_no_permitted_axioms"
+            if args.verify and permitted_axioms:
+                print("Verifying temporary axiom hashes in prepared modules...", flush=True)
+                verify_prepared_axiom_hashes(
+                    paths,
+                    target_decl=str(target_info["decl_name"]),
+                    target_module=str(target_info["module"]),
+                    module_closure=module_closure,
+                    permitted_axioms=permitted_axioms,
+                )
+                verification_status = "completed"
+            elif args.verify:
+                print(
+                    "Skipping prepare-time hash verification because no permitted temporary axioms were registered.",
+                    flush=True,
+                )
+                verification_status = "skipped_no_permitted_axioms"
             session_payload = {
                 "schema_version": 3,
                 "base_commit": base_commit,
@@ -2225,8 +2404,7 @@ def prepare_session(args: argparse.Namespace, paths) -> None:
                 session_payload=session_payload,
                 permitted_axioms=permitted_axioms,
             )
-            if args.verify:
-                ensure_active_session_consistent(paths, inspect_session_state(paths))
+            ensure_active_session_consistent(paths, inspect_session_state(paths))
         except BaseException:
             cleanup_session_artifacts(paths, edits)
             reset_generated_runtime(paths)
@@ -2311,7 +2489,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--no-verify",
         dest="verify",
         action="store_false",
-        help="Skip the final target-module rebuild during prepare. The prepared workspace may still surface errors on the next `lake build`.",
+        help="Skip the prepare-time temporary-axiom hash verification pass and trust the frozen hashes from offline replay.",
     )
     prepare.set_defaults(verify=True)
 
