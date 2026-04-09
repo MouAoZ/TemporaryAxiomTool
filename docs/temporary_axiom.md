@@ -7,6 +7,12 @@
 - 快速使用见 [../README.md](../README.md)
 - 迁移说明见 [downstream_upgrade_note.md](./downstream_upgrade_note.md)
 
+当前 `single-generated-session` 分支相对 `main` 的主要区别：
+
+- `main` 使用分模块 prepared runtime：`TemporaryAxiomTool/PreparedSession/Target.lean` 与 `TemporaryAxiomTool/PreparedSession/Permitted/**/*.lean`；当前分支继续使用单个 `TemporaryAxiomTool/PreparedSession/Generated.lean`。
+- `main` 会在项目源码里插入 target import 与当前模块对应的 permitted shard import；当前分支只插入 `import TemporaryAxiomTool.TemporaryAxiom`，由运行时从 `Generated.lean` 读取聚合后的 target / permitted 表。
+- 两边都默认做 prepare-time hash verification，并都支持 `--no-verify`；区别不在 verify 语义，而在 generated runtime 的组织方式。
+
 ## 1. 文件结构
 
 ```text
