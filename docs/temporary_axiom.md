@@ -10,8 +10,8 @@
 当前 `module-sharded-session` 分支相对 `main` 的主要区别：
 
 - `main` 使用单个 `TemporaryAxiomTool/PreparedSession/Generated.lean`；当前分支拆成 `Target.lean` 和 `Permitted/**/*.lean`。
-- `main` 默认在 `prepare` 末尾做一次 prepare-time hash verification，并提供 `--no-verify` 关闭；当前分支现在也保持同样的 CLI 语义，但 verify 的 runtime 布局仍然是分 shard 版本。
-- 当前分支在 `prepare` 内离线 replay permitted declarations，直接冻结 axiom-side hash。
+- `main` 默认在 `prepare` 末尾做一次 prepare-time hash verification，并提供 `--no-verify` 关闭；当前分支现在也保持同样的 CLI 语义，但 verify 时重写的是分 shard runtime。
+- 两边都会先用离线 axiom replay 为 permitted declarations 生成初始 axiom-side hash；当前分支的区别不在 hash 来源，而在 generated runtime 按模块分 shard 写出。
 
 ## 1. 文件结构
 
