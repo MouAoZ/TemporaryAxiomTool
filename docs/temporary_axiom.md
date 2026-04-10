@@ -1,6 +1,6 @@
 # TemporaryAxiomTool 技术规格
 
-这份文档只描述当前工具本身的技术行为。
+这份文档描述当前 `wild-skip` 架构的实现行为。
 
 相关文档：
 
@@ -11,46 +11,94 @@
 
 ```text
 .
-├── README.md                                   # 入口文档
-├── temporary_axiom_tool_session_report.txt     # 生成物：给用户看的明文 session 报告
+├── README.md
 ├── docs/
-│   ├── temporary_axiom.md                      # 技术规格
-│   └── downstream_upgrade_note.md              # 旧工作流迁移说明
+│   ├── temporary_axiom.md
+│   └── downstream_upgrade_note.md
 ├── scripts/
-│   ├── temporary_axiom_session.py              # CLI 入口
+│   ├── temporary_axiom_session.py
 │   └── session_tool/
-│       ├── cli.py                              # prepare / cleanup 主流程
-│       ├── common.py                           # 路径、JSON、模块路径辅助
-│       └── lean_ops.py                         # 调 lake / lean probe，并写生成 runtime
-├── TemporaryAxiomTool.lean                     # 库根模块
+│       ├── cli.py
+│       ├── common.py
+│       └── lean_ops.py
+├── TemporaryAxiomTool.lean
 ├── TemporaryAxiomTool/
-│   ├── TemporaryAxiom.lean                     # `@[temporary_axiom]` 与 theorem -> axiom 改写
-│   ├── PreparedSession.lean                    # probe 命令，读取 generated runtime
-│   ├── PreparedSession/
-│   │   ├── Types.lean                          # generated runtime 使用的数据结构
-│   │   ├── Target.lean                         # 生成物：当前 session 的 frozen target runtime
-│   │   └── Permitted/                          # 生成物：按模块分片的 permitted runtime
-│   ├── StatementHash.lean                      # elaborated statement hash
-│   └── TestFixture/                            # 测试项目
-│       ├── DepA.lean
-│       ├── DepB.lean
-│       └── Target.lean
-└── .temporary_axiom_session/
-    ├── prepare.lock                           # 生成物：`prepare` 运行期间的互斥锁
-    └── session.json                           # 生成物：当前 session 的 freeze + cleanup 信息
+│   ├── TemporaryAxiom.lean
+│   ├── TheoremRegistry.lean
+│   ├── TheoremRegistry/
+│   │   ├── Types.lean
+│   │   └── Shards/                       # 生成物：每个 tracked module 一份
+│   ├── StatementHash.lean
+│   └── TestFixture/
+├── .temporary_axiom_session/
+│   ├── prepare.lock                      # `prepare` 执行期间的互斥锁
+│   └── session.json                      # 当前活动 session 的 freeze 数据
+├── .temporary_axiom_registry/
+│   └── proved_theorems.json              # 本地持久 proved theorem 数据库
+└── temporary_axiom_tool_session_report.txt
 ```
 
 说明：
 
-- `TemporaryAxiomTool/PreparedSession/Target.lean` 是生成物；没有活动 session 时会被重置为空 target runtime。
-- `TemporaryAxiomTool/PreparedSession/Permitted/**/*.lean` 是生成物；只有当前 session 实际涉及 permitted axioms 的模块才会生成对应 shard。
-- `.temporary_axiom_session/prepare.lock` 是瞬时生成物；只在 `prepare` 执行期间存在。
-- `.temporary_axiom_session/session.json` 是生成物；只有 `prepare` 之后才存在。
-- `temporary_axiom_tool_session_report.txt` 也是生成物；`cleanup` 会一并删除。
+- `TemporaryAxiomTool/TheoremRegistry/Shards/**/*.lean` 是工具管理的 runtime shard。tracked module 一旦接入，就会稳定 import 自己那份 shard。
+- `.temporary_axiom_session/` 只在活动 session 期间存在。
+- `.temporary_axiom_registry/proved_theorems.json` 是本地持久状态，不随 `cleanup` 删除。
 
-## 2. 命令
+## 2. 跟踪范围
 
-当前版本只提供两条命令：
+只有直接 `import TemporaryAxiomTool` 的项目模块才会被视为 tracked module。
+
+这条规则同时决定：
+
+- 哪些模块允许作为 `prepare --target` 的定义模块。
+- 哪些模块会被持续维护 proved theorem 数据库。
+- 哪些模块源码里会保留稳定 shard import。
+
+`prepare` 不会自动把整个项目都纳入跟踪。若目标模块尚未直接 import `TemporaryAxiomTool`，会直接报错。
+
+## 3. 运行时中的四类定理
+
+活动 session 中，`TemporaryAxiomTool.TemporaryAxiom` 只拦截顶层 `theorem` / `lemma` 声明，并按下面四类处理：
+
+1. `target`
+   目标定理。先按 theorem header 规则 elaboration 出最终声明名和类型，计算 theorem-side statement hash；校验通过后继续正常 theorem elaboration，不跳过证明体。
+2. `persistent proved`
+   来自 proved DB 的已证明定理。校验 theorem-side hash 后，直接注册为同名 `axiom`，跳过证明体 elaboration。
+3. `session temporary`
+   本次 target closure 里显式 `sorry` 的 theorem / lemma。处理方式与 `persistent proved` 相同，也是“先验 hash，再注册同名 axiom”。
+4. `other`
+   不在以上集合中的定理。完全不改写，走 Lean 内建 theorem elaboration。
+
+无活动 session 时，命令 elaborator 不会做 theorem -> axiom 改写。
+
+## 4. Statement Hash 语义
+
+当前版本统一使用 theorem-side statement hash。
+
+具体做法是：
+
+1. 先按 theorem header 规则解析声明名、universe params、binders 和 type。
+2. 对 elaboration 后的 `(levelParams, type)` 计算 hash。
+3. 只对 target / permitted theorem 做校验。
+4. 校验通过后，target 继续作为 theorem；permitted theorem 改写成同名 axiom。
+
+这里不依赖源码文本，也不依赖 axiom-side replay。
+
+## 5. `@[temporary_axiom]`
+
+显式 `@[temporary_axiom]` 仍然存在，但语义变成：
+
+- 它是一个显式校验入口，而不是脚本自动插入的 managed 标记。
+- 只有活动 session 中才有意义。
+- 目标定理不能带这个标签。
+- 非 permitted 声明带这个标签会直接报错。
+- permitted 声明即使不带这个标签，也会在活动 session 中自动按规则处理。
+
+也就是说，标签现在是可选的；工具的主要机制已经不再依赖源码批量打标签。
+
+## 6. `prepare`
+
+命令行：
 
 ```bash
 python3 scripts/temporary_axiom_session.py prepare --target MyProj.Mod:goal
@@ -58,38 +106,153 @@ python3 scripts/temporary_axiom_session.py prepare --target MyProj.Mod:My.Namesp
 python3 scripts/temporary_axiom_session.py prepare --target MyProj.Mod.goal
 python3 scripts/temporary_axiom_session.py prepare --target MyProj.Mod:goal --auto-build
 python3 scripts/temporary_axiom_session.py prepare --target MyProj.Mod:goal --no-verify
+```
+
+参数：
+
+- `--target`
+  支持 `<module>:<decl>` 或 `<fully-qualified-decl>`。
+- `--auto-build`
+  允许在预检阶段自动 `lake build` 缺失或过期的模块闭包。
+- `--no-verify`
+  跳过最后一次真实 `lake build <target-module>`。
+
+### 6.1 target 解析
+
+- `<module>:<decl>`
+  这里的模块部分必须是声明的定义模块。
+- 若 `decl` 不含 `.`
+  按“定义模块里的短名”唯一匹配。
+- 若 `decl` 含 `.`
+  当成 Lean 全限定声明名处理，并要求它就在给定定义模块里。
+- `<fully-qualified-decl>`
+  只按声明名前缀尝试有限个候选模块；若声明名和模块路径不对齐，应改用前一种形式。
+
+### 6.2 预检
+
+`prepare` 会先检查相关模块的：
+
+- `.ilean`
+- `.olean`
+- `.trace`
+- `.ilean` 记录的 direct imports 是否仍和当前源码一致
+- `.trace` 里的源码文本 hash 是否仍和当前源码一致
+
+若目标模块或需要维护的 tracked modules 不满足这些条件，则：
+
+- 默认直接报错。
+- 只有显式给 `--auto-build` 时才会自动补构建。
+
+### 6.3 proved DB 的全量维护
+
+`prepare` 会读取 `.temporary_axiom_registry/proved_theorems.json`，并对“发生变化或被标记 dirty 的 tracked modules”做全量维护：
+
+1. 丢弃这些模块旧的 proved entries。
+2. 重新扫描这些模块里所有“已证明的 theorem / lemma”。
+3. 重新 probe 它们的 theorem-side statement hash。
+4. 用新结果回写 proved DB。
+
+这里的“已证明”只指源码里没有显式 `sorry` 的 theorem / lemma；显式 `sorry` 的声明不会进入持久 proved DB。
+
+### 6.4 session-local temporary axioms
+
+在 proved DB 刷新完后，`prepare` 会针对 target 收集 session-local temporary axioms：
+
+- 只扫描 target 的项目内依赖闭包。
+- 只看 tracked modules。
+- 依赖模块里：收集显式 `sorry` 的 theorem / lemma。
+- target 所在模块里：只收集排在 target 之前的显式 `sorry` theorem / lemma。
+
+### 6.5 permitted 集合
+
+最终 permitted 集合为：
+
+`persistent proved ∪ session temporary - {target}`
+
+每个 permitted entry 都记录：
+
+- `decl_name`
+- `module`
+- `statement_hash`
+- `origin`
+
+其中 `origin` 当前有两种值：
+
+- `persistent_proved`
+- `session_temporary`
+
+### 6.6 shard 生成
+
+工具会为每个 tracked module 生成一份 shard：
+
+- 路径：
+  `TemporaryAxiomTool/TheoremRegistry/Shards/<ModulePath>.lean`
+- shard 内注册的数据：
+  - 当前 host module
+  - 当前 session 的 target name / hash
+  - 该 host module 自己的 permitted theorem 表
+
+注册使用 `#register_temporary_axiom_module_shard ...` 自定义命令，一次性把该模块的数据放进 `SimplePersistentEnvExtension`。
+
+当前实现不是“每个 theorem 一条 marker declaration”，而是“每个模块一张表”。
+
+### 6.7 稳定 import
+
+如果 tracked module 还没有：
+
+```lean
+import TemporaryAxiomTool.TheoremRegistry.Shards.<Module>
+```
+
+`prepare` 会在 import 头里插入这行。这个 import 之后会一直保留；`cleanup` 不会删掉它。
+
+### 6.8 verify
+
+默认情况下，`prepare` 最后会执行：
+
+```bash
+lake build <target-module>
+```
+
+目的不是回填 hash，而是确认“写完 active shards 后的真实 workspace”可以直接编译。
+
+`--no-verify` 只会跳过这一步；不会影响前面的 hash 冻结逻辑。
+
+## 7. `cleanup`
+
+命令行：
+
+```bash
 python3 scripts/temporary_axiom_session.py cleanup
 ```
 
-## 3. Session 语义
+`cleanup` 的行为：
 
-一次 session，是围绕一个 target theorem 建立的一次受控证明尝试环境。
+1. 读取活动 session。
+2. 找出自上次 registry digest 以来发生变化的 tracked modules。
+3. 对这些模块做增量扫描，把新证明成功的 theorem / lemma 加进 proved DB。
+4. 把这些变化模块标记为 `dirty_modules`，确保下一次 `prepare` 会对它们做一次全量维护。
+5. 把所有 shard 重写为 inactive 状态：
+   - `target = anonymous`
+   - `target_hash = 0`
+   - `permitted = persistent proved entries by module`
+6. 删除：
+   - `.temporary_axiom_session/session.json`
+   - `temporary_axiom_tool_session_report.txt`
 
-`prepare` 会：
+`cleanup` 不再做下面这些旧行为：
 
-1. 冻结 target theorem 和本次允许临时公理化的声明。
-2. 生成 Lean 侧 runtime，让 Lean 能读到这次冻结结果。
-3. 对源码插入 managed import 和 managed `@[temporary_axiom]`。
+- 不删除 shard import
+- 不回滚源码 attribute
+- 不删除 `.temporary_axiom_registry/proved_theorems.json`
 
-这样做的目的，是让 Lean 在当前 workspace 里把“允许跳过证明的声明”临时当作公理使用，同时仍然在 elaboration 阶段检查：
+## 8. `session.json`
 
-- 该声明是否在 permitted 集合中；
-- 它是否错误地等于 target；
-- 它的 statement 是否相对冻结结果发生了漂移。
-
-## 4. 产物
-
-活动 session 会生成三个产物：
-
-- `.temporary_axiom_session/session.json`
-- `temporary_axiom_tool_session_report.txt`
-- `TemporaryAxiomTool/PreparedSession/Target.lean` 与 `TemporaryAxiomTool/PreparedSession/Permitted/**/*.lean`
-
-`session.json` 的稳定结构是：
+当前 `session.json` 结构：
 
 ```json
 {
-  "schema_version": 3,
+  "schema_version": 4,
   "base_commit": "optional git sha",
   "freeze": {
     "target": {
@@ -97,161 +260,100 @@ python3 scripts/temporary_axiom_session.py cleanup
       "module": "MyProj.Mod",
       "statement_hash": "123"
     },
+    "tracked_modules": ["MyProj.Mod", "MyProj.Dep"],
     "module_closure": ["MyProj.Mod", "MyProj.Dep"],
-    "permitted_axioms": [
+    "session_temporary_axioms": [
       {
         "decl_name": "MyProj.Dep.dep_sorry",
         "module": "MyProj.Dep",
         "statement_hash": "456",
-        "origin": "dependency_module"
+        "origin": "session_temporary"
+      }
+    ],
+    "permitted_axioms": [
+      {
+        "decl_name": "MyProj.Dep.dep_done",
+        "module": "MyProj.Dep",
+        "statement_hash": "789",
+        "origin": "persistent_proved"
       }
     ]
-  },
-  "cleanup": {
-    "edits": {
-      "imports": [
-        {
-          "file": "MyProj/Mod.lean",
-          "module": "TemporaryAxiomTool.PreparedSession.Target"
-        },
-        {
-          "file": "MyProj/Mod.lean",
-          "module": "TemporaryAxiomTool.PreparedSession.Permitted.MyProj.Mod"
-        }
-      ],
-      "attributes": []
-    }
   }
+}
+```
+
+注意：
+
+- 当前版本已经没有 `cleanup.edits`。
+- `target.decl_name` 永远是 Lean 真实全限定声明名。
+- `target.module` 永远是定义模块名。
+
+## 9. `proved_theorems.json`
+
+proved DB 结构：
+
+```json
+{
+  "schema_version": 1,
+  "tracked_modules": ["MyProj.Mod", "MyProj.Dep"],
+  "dirty_modules": ["MyProj.Mod"],
+  "module_digests": {
+    "MyProj.Mod": "deadbeef..."
+  },
+  "proved_theorems": [
+    {
+      "decl_name": "MyProj.Mod.helper",
+      "module": "MyProj.Mod",
+      "file": "MyProj/Mod.lean",
+      "statement_hash": "123"
+    }
+  ]
 }
 ```
 
 字段语义：
 
-- `schema_version`
-  当前 session 文件格式版本。
-- `base_commit`
-  调用方传入或自动读取的基准 commit 记录。
-- `freeze`
-  这次 attempt 的冻结信息，供外层 verifier / comparator 读取。
-- `cleanup`
-  本工具自己的 edit log，供 `cleanup` 回滚 managed 修改。
+- `tracked_modules`
+  上次维护时看到的 tracked module 列表。
+- `dirty_modules`
+  cleanup 曾增量登记过、但下一次 prepare 仍需做全量维护的模块。
+- `module_digests`
+  用于判断 tracked module 源码是否变化。
+- `proved_theorems`
+  持久登记的已证明 theorem / lemma 列表。
 
-`freeze` 的子字段语义：
+## 10. 报告文件
 
-- `target`
-  本次 attempt 的目标定理，以及它冻结时的 statement hash。`target.decl_name` 是 Lean 的真实全限定声明名；`target.module` 是定义模块名。
-- `module_closure`
-  为收集 permitted declarations 而考察过的项目内模块闭包。
-- `permitted_axioms`
-  允许携带 `@[temporary_axiom]` 的声明列表。每条记录里的 `decl_name` 也是 Lean 的真实全限定声明名，而不是由模块名和短名机械拼接出来的字符串。
+`temporary_axiom_tool_session_report.txt` 是给人读的摘要，包含：
 
-`permitted_axioms[*].origin` 当前有两种来源：
+- target
+- tracked module 列表
+- target closure
+- session temporary axioms 数量
+- permitted axioms 按模块分组后的列表
+- 本次 session 相关产物路径
 
-- `prior_same_module`
-  target 同模块且位于 target 之前。
-- `dependency_module`
-  target 依赖模块中的显式 `sorry` theorem 声明。
+它不是运行时输入；运行时只依赖 shard 和 `session.json`。
 
-`temporary_axiom_tool_session_report.txt` 的语义：
+## 11. 实现边界
 
-- 给用户看的明文摘要
-- 汇总 target、base commit、module closure 和按模块分组的 permitted temporary axioms
+- 不解析 `.olean` 二进制格式。
+- `.ilean` 只用于 declaration range 和 import 信息。
+- 源码扫描只负责判定“theorem / lemma 是否显式 `sorry`”以及“是否已证明”。
+- 真正的 statement hash 只通过 Lean elaboration 获取。
+- 无活动 session 时，不进行 theorem -> axiom 改写。
 
-## 5. `prepare`
-
-`prepare` 的输入：
-
-- `--target` 必填，支持两种格式：
-  - `<module>:<decl>`
-  - `<fully-qualified-decl>`
-- `--base-commit <sha>` 可选；默认取当前 `HEAD`
-- `--auto-build` 可选；显式允许 `prepare` 在发现模块产物缺失或与当前源码不同步时先补构建
-- 默认会在写完 generated runtime shard 和源码 managed 修改后，做一次 prepare-time temporary-axiom hash verification
-- `--no-verify` 可选；显式跳过这次 prepare-time hash verification，直接信任离线 replay 冻结出的 hash
-
-流程：
-
-1. 解析 `--target`：
-   - 若是 `<module>:<decl>`，模块部分总是视为定义模块；声明部分若不含 `.`，则按“模块内短名”定向解析唯一匹配的声明，若含 `.`，则按完整声明名处理。
-   - 若是 `<fully-qualified-decl>`，只按声明名前缀尝试有限个候选模块，不做仓库扫描。
-2. 如果当前没有活动 session，而 generated runtime 还停留在旧 session 状态，则先重置 runtime。
-3. 尽早检查目标模块闭包是否就绪；preflight 会把旧 tool-managed import / attr 残留视作不存在。默认直接报错，只有显式给出 `--auto-build` 时才会调用 `lake build <root-module>` 补构建。
-4. 获取 `prepare.lock`，拒绝并发的第二个 `prepare`。
-5. 读取 target 模块 `.ilean` 的 `directImports`，计算项目内 module closure。
-6. 先做模块级预筛：只继续扫描源码里可能同时出现 `theorem` 与显式 `sorry` 的模块；这一步也会忽略旧 tool-managed 残留。
-7. 对保留下来的模块读取 `.ilean` 的 `decls`。
-8. 只对源码头部是 `theorem` 的声明，在 declaration 自己的源码 range 内检查是否显式出现 `sorry`。
-9. 对目标声明做 Lean probe，读取 target 的 statement hash；对命中的 permitted declaration 做离线 axiom replay，读取 axiom-side statement hash。
-10. 写出 `TemporaryAxiomTool/PreparedSession/Target.lean` 和按模块分组的 `TemporaryAxiomTool/PreparedSession/Permitted/**/*.lean`。
-11. 只在本次确实需要打标记的源码文件里修改源码：每个文件会直接插入 `TemporaryAxiomTool.PreparedSession.Target`，以及该文件所属模块对应的 permitted shard import。没有现成 attr block 的声明会插入独立的 managed `@[temporary_axiom]` 行；已有 attr block 的声明会把 `temporary_axiom` 合并进原 block，并带上可清理的 managed 标记。如果声明头里本来就有 `temporary_axiom`，则直接复用，不重复插入。
-12. 默认会做一次 prepare-time temporary-axiom hash verification：按依赖顺序对含 permitted axioms 的模块做真实 `lake build`，若出现 mismatch，则从 Lean 报错中回填实际 elaborated hash 并重写对应 runtime shard；若显式给出 `--no-verify`，则跳过这一步。即使 verify 打开，只要 permitted 集合为空，也会安全跳过这次校验，因为当前 prepared workspace 不会注册任何 permitted temporary axioms。
-13. 写出 `session.json` 与 `temporary_axiom_tool_session_report.txt`。
-14. 立即用 `session.json`、generated target / permitted shard 和本次 edit log 做一次本地一致性自检。
-15. 删除 `prepare.lock`。
-
-当前 permitted 集合只包含两类声明：
-
-- target 同模块且位于 target 之前的显式 `sorry` theorem 声明
-- target 依赖模块中的显式 `sorry` theorem 声明
-
-这里之所以要改源码，是因为运行时检查发生在 Lean elaboration 里：项目源码文件需要真实 import `TemporaryAxiomTool.PreparedSession.Target` 与本模块对应的 permitted shard，并且真实给声明加上 `@[temporary_axiom]`，这些声明才会在当前 attempt 中按“受检查的临时公理”工作。permitted shard 自身再导入 `TemporaryAxiomTool.TemporaryAxiom`，从而拿到 attribute 与运行时检查逻辑。
-
-`prepare` 的命令行输出会额外给出：
-
-- 涉及模块数量
-- permitted temporary axioms 数量
-- 列表较短时的按模块内联清单
-- 详细数据所在路径
-
-活动 session 的一致性检查只读取两类信息：
-
-- `session.json` / generated target + permitted shard
-- 当前活动 session 的 `cleanup.edits` 里列出的源码文件
-
-这些检查都是局部检查，不引入新的全仓库扫描。
-
-## 6. 运行时检查
-
-`@[temporary_axiom]` 会把带标签的 `theorem` 改写成 `axiom`，然后在类型检查后校验：
-
-1. 该声明必须在本次 session 的 permitted 集合里
-2. 该声明不能是 frozen target
-3. 当前 elaborated statement hash 必须与冻结值一致
-
-非法标签会直接在声明处报错。
-
-## 7. `cleanup`
-
-`cleanup` 不使用旧行号，而是只根据 `session.json.cleanup` 中记录的 managed edit log 清理：
-
-1. 删除 managed import
-2. 删除或还原 managed `@[temporary_axiom]`
-3. 重置 `TemporaryAxiomTool/PreparedSession/Target.lean`，并删除 `TemporaryAxiomTool/PreparedSession/Permitted/**/*.lean`
-4. 删除 `.temporary_axiom_session/session.json`
-5. 删除 `temporary_axiom_tool_session_report.txt`
-6. 尝试移除空的 `.temporary_axiom_session/`
-
-如果上一次中断只留下了 tool-managed 残留，而活动 session 文件已经不存在，下一次 `prepare` 也会在 preflight 和扫描阶段忽略这些残留；只有这次实际要编辑的文件才会被重新写回，不要求用户先手动返工。
-
-## 8. 实现边界
-
-- `.ilean` 提供 declaration range 与 import closure
-- `prepare` 默认不隐式长时间补构建；以下情况会尽早报错，只有 `--auto-build` 才会补构建：
-  - 缺少 `.ilean` / `.olean` / `.trace`
-  - 当前源码 import 头与 `.ilean` 记录不一致
-  - 当前源码文本哈希与 Lake `.trace` 记录不一致
-- 源码扫描只负责“源码头是 `theorem` 且正文含显式 `sorry`”的判定，并先按模块做轻量预筛
-- Lean probe 只负责 statement hash
-- 不直接解析 `.olean` 二进制文件
-
-## 9. 回归测试
+## 12. 最小回归测试
 
 ```bash
-lake build TemporaryAxiomTool.TestFixture.Target
+python3 -m py_compile \
+  scripts/temporary_axiom_session.py \
+  scripts/session_tool/*.py
+
+lake build TemporaryAxiomTool
+
 python3 scripts/temporary_axiom_session.py prepare \
   --target TemporaryAxiomTool.TestFixture.Target:goal
-python3 scripts/temporary_axiom_session.py prepare \
-  --target TemporaryAxiomTool.TestFixture.Target.goal
 lake build TemporaryAxiomTool.TestFixture.Target
 python3 scripts/temporary_axiom_session.py cleanup
 lake build TemporaryAxiomTool.TestFixture.Target

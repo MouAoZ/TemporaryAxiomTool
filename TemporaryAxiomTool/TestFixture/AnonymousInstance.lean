@@ -1,5 +1,8 @@
 module
 
+import TemporaryAxiomTool
+import TemporaryAxiomTool.TheoremRegistry.Shards.TemporaryAxiomTool.TestFixture.AnonymousInstance
+
 namespace TemporaryAxiomTool.TestFixture.AnonymousInstance
 
 structure Wrap where

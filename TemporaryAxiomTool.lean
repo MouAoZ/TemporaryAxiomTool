@@ -1,3 +1,3 @@
 module
-public import TemporaryAxiomTool.PreparedSession
+public import TemporaryAxiomTool.TheoremRegistry
 public import TemporaryAxiomTool.TemporaryAxiom

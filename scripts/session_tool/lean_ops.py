@@ -11,10 +11,10 @@ from pathlib import Path
 
 from .common import (
     TOOL_NAMESPACE,
-    TOOL_PREPARED_SESSION_MODULE,
-    TOOL_PREPARED_SESSION_PERMITTED_MODULE_PREFIX,
-    TOOL_PREPARED_SESSION_TYPES_MODULE,
-    TOOL_TEMPORARY_AXIOM_MODULE,
+    TOOL_ROOT_MODULE,
+    TOOL_THEOREM_REGISTRY_MODULE,
+    TOOL_THEOREM_REGISTRY_SHARDS_MODULE_PREFIX,
+    TOOL_THEOREM_REGISTRY_TYPES_MODULE,
     ensure_layout,
     fail,
     module_name_to_relative_path,
@@ -38,16 +38,14 @@ def run_command(
             check=False,
             env=env,
         )
-    except FileNotFoundError as exc:
+    except FileNotFoundError:
         fail(
             f"{description} 无法启动。",
             details=[
                 f"命令：`{shlex.join(args)}`",
                 f"缺失可执行文件：`{args[0]}`",
             ],
-            hints=[
-                "确认对应命令已经安装，并且在当前 shell 的 PATH 里。",
-            ],
+            hints=["确认对应命令已经安装，并且在当前 shell 的 PATH 里。"],
         )
     if result.returncode != 0 and not allow_failure:
         output = "\n".join(part for part in [result.stdout.strip(), result.stderr.strip()] if part)
@@ -190,10 +188,7 @@ def compute_text_hashes_for_resolved_paths(paths, resolved_paths: list[Path]) ->
         ]
         if len(missing_paths) > len(preview):
             details.append(f"其余缺失条目：{len(missing_paths) - len(preview)} 个")
-        fail(
-            "Lean 文本哈希工具没有返回全部请求文件。",
-            details=details,
-        )
+        fail("Lean 文本哈希工具没有返回全部请求文件。", details=details)
     return hashes
 
 
@@ -242,19 +237,6 @@ def compute_text_hashes(
             hashes[original_path] = hash_value
         else:
             hashes[path] = hash_value
-    missing_paths = [str(path) for path, _ in resolved_text_items if path not in hashes]
-    if missing_paths:
-        preview = missing_paths[:10]
-        details = [
-            f"缺失数量：{len(missing_paths)}",
-            "缺失文件：\n" + "\n".join(f"- `{path}`" for path in preview),
-        ]
-        if len(missing_paths) > len(preview):
-            details.append(f"其余缺失条目：{len(missing_paths) - len(preview)} 个")
-        fail(
-            "Lean 文本哈希工具没有返回全部规范化源码。",
-            details=details,
-        )
     return hashes
 
 
@@ -269,13 +251,13 @@ def compute_text_hashes_for_texts(paths, texts_by_path: dict[Path, str]) -> dict
 def ensure_probe_tool_ready(paths) -> None:
     required_modules = [
         f"{TOOL_NAMESPACE}.StatementHash",
-        f"{TOOL_NAMESPACE}.PreparedSession.Types",
-        f"{TOOL_NAMESPACE}.PreparedSession",
+        TOOL_THEOREM_REGISTRY_TYPES_MODULE,
+        TOOL_THEOREM_REGISTRY_MODULE,
     ]
     required_sources = [
         paths.project_root / TOOL_NAMESPACE / "StatementHash.lean",
-        paths.project_root / TOOL_NAMESPACE / "PreparedSession" / "Types.lean",
-        paths.project_root / TOOL_NAMESPACE / "PreparedSession.lean",
+        paths.project_root / TOOL_NAMESPACE / "TheoremRegistry" / "Types.lean",
+        paths.project_root / TOOL_NAMESPACE / "TheoremRegistry.lean",
     ]
     for module_name in required_modules:
         olean_path = module_artifact_path(paths, module_name, ".olean")
@@ -345,7 +327,7 @@ def run_lean_probe(
     description: str,
     allow_failure: bool = False,
 ) -> tuple[subprocess.CompletedProcess[str], list[dict[str, object]]]:
-    lines = ["module", f"import {TOOL_PREPARED_SESSION_MODULE}"]
+    lines = ["module", f"import {TOOL_THEOREM_REGISTRY_MODULE}"]
     for module_name in imports:
         lines.append(f"import {module_name}")
     lines.append("")
@@ -387,134 +369,104 @@ def try_probe_decl_in_module(paths, module_name: str, decl_name: str) -> dict[st
     return payloads[0]
 
 
-def generated_permitted_runtime_module_name(module_name: str) -> str:
-    return f"{TOOL_PREPARED_SESSION_PERMITTED_MODULE_PREFIX}.{module_name}"
+def generated_shard_runtime_module_name(module_name: str) -> str:
+    return f"{TOOL_THEOREM_REGISTRY_SHARDS_MODULE_PREFIX}.{module_name}"
 
 
-def generated_permitted_runtime_path(paths, module_name: str) -> Path:
-    return paths.project_root / module_name_to_relative_path(
-        generated_permitted_runtime_module_name(module_name)
-    )
+def generated_shard_runtime_path(paths, module_name: str) -> Path:
+    return paths.project_root / module_name_to_relative_path(generated_shard_runtime_module_name(module_name))
 
 
-def generated_target_source(*, target_decl: str | None) -> str:
-    body = ""
-    if target_decl is not None:
-        body = (
-            f"@[temporary_axiom_target_runtime \"{target_decl}\"]\n"
-            "public axiom runtime_target_marker : True\n"
-        )
-    return (
-        "module\n\n"
-        "/-\n"
-        "Auto-generated prepared-session target runtime.\n"
-        "This file is managed by TemporaryAxiomTool.\n"
-        "-/\n"
-        f"public import {TOOL_TEMPORARY_AXIOM_MODULE}\n\n"
-        "namespace TemporaryAxiomTool.PreparedSession.Target\n\n"
-        f"{body}\n"
-        "end TemporaryAxiomTool.PreparedSession.Target\n"
-    )
-
-
-def generated_permitted_module_source(
+def generated_shard_module_source(
     *,
     module_name: str,
+    target_decl: str | None,
+    target_hash: str | None,
     permitted_axioms: list[dict[str, object]],
 ) -> str:
     permitted_payload = "\n".join(
         f"{entry['decl_name']}\t{entry['statement_hash']}"
         for entry in sorted(permitted_axioms, key=lambda item: str(item["decl_name"]))
     )
-    generated_module = generated_permitted_runtime_module_name(module_name)
+    generated_module = generated_shard_runtime_module_name(module_name)
     return (
         "module\n\n"
         "/-\n"
-        "Auto-generated prepared-session permitted axioms.\n"
+        "Auto-generated theorem-registry shard.\n"
         "This file is managed by TemporaryAxiomTool.\n"
         "-/\n"
-        f"public import {TOOL_TEMPORARY_AXIOM_MODULE}\n\n"
-        f"namespace {generated_module}\n\n"
-        f"@[temporary_axiom_permitted_runtime_batch {lean_string_literal(permitted_payload)}]\n"
-        "public axiom runtime_permitted_marker : True\n\n"
-        f"end {generated_module}\n"
+        f"import {TOOL_THEOREM_REGISTRY_MODULE}\n\n"
+        f"#register_temporary_axiom_module_shard "
+        f"{lean_string_literal(module_name)} "
+        f"{lean_string_literal(target_decl or '')} "
+        f"{lean_string_literal(target_hash or '0')} "
+        f"{lean_string_literal(permitted_payload)}\n"
     )
 
 
-def generated_session_sources(
+def generated_shard_sources(
     paths,
     *,
+    tracked_modules: list[str],
     target_decl: str | None,
+    target_hash: str | None,
     permitted_axioms: list[dict[str, object]],
 ) -> dict[Path, str]:
     grouped: dict[str, list[dict[str, object]]] = {}
     for entry in permitted_axioms:
         grouped.setdefault(str(entry["module"]), []).append(entry)
-    sources: dict[Path, str] = {
-        paths.generated_target_file: generated_target_source(target_decl=target_decl),
-    }
-    for module_name, module_entries in sorted(grouped.items()):
-        sources[generated_permitted_runtime_path(paths, module_name)] = generated_permitted_module_source(
+    return {
+        generated_shard_runtime_path(paths, module_name): generated_shard_module_source(
             module_name=module_name,
-            permitted_axioms=module_entries,
+            target_decl=target_decl,
+            target_hash=target_hash,
+            permitted_axioms=grouped.get(module_name, []),
         )
-    return sources
+        for module_name in tracked_modules
+    }
 
 
-def write_generated_runtime(paths, *, target_decl: str, permitted_axioms: list[dict[str, object]]) -> None:
+def write_generated_shards(
+    paths,
+    *,
+    tracked_modules: list[str],
+    target_decl: str | None,
+    target_hash: str | None,
+    permitted_axioms: list[dict[str, object]],
+) -> None:
     ensure_layout(paths)
-    sources = generated_session_sources(
+    sources = generated_shard_sources(
         paths,
+        tracked_modules=tracked_modules,
         target_decl=target_decl,
+        target_hash=target_hash,
         permitted_axioms=permitted_axioms,
     )
     for path, source in sources.items():
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(source, encoding="utf-8")
     expected_paths = set(sources)
-    for path in sorted(paths.generated_permitted_root.rglob("*.lean")):
+    for path in sorted(paths.generated_shards_root.rglob("*.lean")):
         if path not in expected_paths:
             path.unlink(missing_ok=True)
-    for directory in sorted(paths.generated_permitted_root.rglob("*"), reverse=True):
+    for directory in sorted(paths.generated_shards_root.rglob("*"), reverse=True):
         if directory.is_dir():
             try:
                 directory.rmdir()
             except OSError:
                 pass
-    paths.legacy_generated_session_file.unlink(missing_ok=True)
 
 
-def write_generated_permitted_runtime(
+def write_inactive_shards(
     paths,
     *,
-    module_name: str,
-    permitted_axioms: list[dict[str, object]],
+    tracked_modules: list[str],
+    persistent_axioms: list[dict[str, object]],
 ) -> None:
-    ensure_layout(paths)
-    path = generated_permitted_runtime_path(paths, module_name)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(
-        generated_permitted_module_source(
-            module_name=module_name,
-            permitted_axioms=permitted_axioms,
-        ),
-        encoding="utf-8",
+    write_generated_shards(
+        paths,
+        tracked_modules=tracked_modules,
+        target_decl=None,
+        target_hash=None,
+        permitted_axioms=persistent_axioms,
     )
-
-
-def reset_generated_runtime(paths) -> None:
-    ensure_layout(paths)
-    paths.generated_target_file.write_text(
-        generated_target_source(target_decl=None),
-        encoding="utf-8",
-    )
-    for path in sorted(paths.generated_permitted_root.rglob("*.lean")):
-        path.unlink(missing_ok=True)
-    for directory in sorted(paths.generated_permitted_root.rglob("*"), reverse=True):
-        if directory.is_dir():
-            try:
-                directory.rmdir()
-            except OSError:
-                pass
-    paths.generated_permitted_root.mkdir(parents=True, exist_ok=True)
-    paths.legacy_generated_session_file.unlink(missing_ok=True)

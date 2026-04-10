@@ -1,6 +1,8 @@
 module
 
+import TemporaryAxiomTool
 import TemporaryAxiomTool.TestFixture.DepB
+import TemporaryAxiomTool.TheoremRegistry.Shards.TemporaryAxiomTool.TestFixture.Target
 
 namespace TemporaryAxiomTool.TestFixture.Target
 

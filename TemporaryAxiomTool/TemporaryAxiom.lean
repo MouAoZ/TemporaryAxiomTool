@@ -1,53 +1,39 @@
 module
 
 public import Lean
-public import TemporaryAxiomTool.PreparedSession
+public import TemporaryAxiomTool.StatementHash
+public import TemporaryAxiomTool.TheoremRegistry
 public meta import Lean
 public meta import Lean.Elab.Command
-public meta import TemporaryAxiomTool.PreparedSession
+public meta import Lean.Elab.Term
+public meta import TemporaryAxiomTool.StatementHash
+public meta import TemporaryAxiomTool.TheoremRegistry
 
 open Lean Elab Command
 
-/- 
-`@[temporary_axiom]` 标记一个“允许临时跳过证明”的 theorem。
-
-这里显式保留 attribute syntax，并在 import 阶段完成 attribute 注册。
-theorem 头部由 `macro_rules` 改写成 axiom，随后 attribute 在类型检查后立即
-核验当前 prepared session 与 statement hash，让错误直接落在声明处。
--/
 syntax (name := Parser.Attr.temporary_axiom) "temporary_axiom" : attr
 
 namespace TemporaryAxiomTool
 
-open TemporaryAxiomTool.PreparedSession
+open TemporaryAxiomTool.TheoremRegistry
 
-/--
-`temporary_axiom` 是无参数标签。
+private meta def userVisibleDeclName (declName : Name) : Name :=
+  match privateToUserName? declName.eraseMacroScopes with
+  | some userName => userName
+  | none => declName.eraseMacroScopes
 
-显式保留 attribute syntax，有利于下游模块在导入后稳定识别该 attribute。
--/
 private meta def ensureTemporaryAxiomNoArgs (stx : Syntax) : AttrM Unit := do
   if stx.getKind == ``Parser.Attr.temporary_axiom then
     pure ()
   else
     Attribute.Builtin.ensureNoArgs stx
 
-/--
-只从已导入环境中的当前 session runtime 读取 permitted axioms。
-
-JSON 到 Lean 的同步由离线脚本完成；这里始终只认当前环境里注册过的 target /
-permitted axioms。
--/
-private meta def permittedEntryFor (declName : Name) : AttrM (Option PermittedAxiom) := do
-  permittedAxiomFor? declName
-
--- 报错正文保持英文，便于直接出现在 Lean/CI 输出中；这里不拼双语长消息。
 private meta def invalidTemporaryAxiomTargetHeader (declName : Name) : MessageData :=
   m!"Invalid @[temporary_axiom] target {.ofConstName declName}"
 
-private meta def noActivePreparedSessionMessage (declName : Name) : MessageData :=
+private meta def noActiveSessionMessage (declName : Name) : MessageData :=
   m!"{invalidTemporaryAxiomTargetHeader declName}\n
-No active prepared session is loaded.\n
+No active theorem-registry session is loaded.\n
 Suggested fixes:\n
 - run the session `prepare` command before using `@[temporary_axiom]`\n
 - or remove the attribute from this declaration"
@@ -61,67 +47,32 @@ Suggested fixes:\n
 
 private meta def declarationNotPermittedMessage (declName : Name) : MessageData :=
   m!"{invalidTemporaryAxiomTargetHeader declName}\n
-The declaration is not listed in the current session's permitted axioms.\n
+The declaration is not listed in the current session's permitted theorems.\n
 Suggested fixes:\n
 - remove the attribute from this declaration\n
 - or regenerate the prepared session so the permitted set is refreshed"
 
 private meta def statementHashMismatchMessage
     (declName : Name)
-    (permittedEntry : PermittedAxiom)
+    (expectedHash : UInt64)
     (actualHash : UInt64) : MessageData :=
-  m!"{invalidTemporaryAxiomTargetHeader declName}\n
-The frozen prepared-session entry does not match the elaborated statement.\n
-Expected hash: {(permittedEntry.statementHash.toNat : Nat)}\n
+  m!"Temporary axiom statement hash mismatch for {.ofConstName declName}\n
+Expected hash: {(expectedHash.toNat : Nat)}\n
 Actual hash:   {(actualHash.toNat : Nat)}\n
 Suggested fixes:\n
 - if the statement changed intentionally, re-run the session `prepare` command\n
 - otherwise inspect recent edits to the theorem header"
 
-/--
-针对当前 prepared session runtime 校验 `@[temporary_axiom]`。
-
-比较发生在 elaboration 之后，因此看到的是最终常量类型，而不是原始语法。
-这样能拦住隐式参数、universe 或命名空间解析导致的真实陈述漂移。
--/
-private meta def validateTemporaryAxiomTarget (declName : Name) : AttrM Unit := do
-  let runtimeDeclName := declName.eraseMacroScopes
-  let frozenTargetName ← targetName
-  if frozenTargetName == Name.anonymous then
-    throwError (noActivePreparedSessionMessage declName)
-  if runtimeDeclName == frozenTargetName then
-    throwError (targetTheoremTaggedMessage declName)
-  let constInfo ← getConstInfo declName
-  let permittedEntry ← match (← permittedEntryFor runtimeDeclName) with
-    | some entry => pure entry
-    | none =>
-        throwError m!"{declarationNotPermittedMessage declName}\n
-Frozen target: {frozenTargetName}"
-  -- 这里使用真正写入环境的常量信息计算 hash，确保比较对象与 Lean 内部语义一致。
-  let actualHash := TemporaryAxiomTool.statementHashOfConstInfo constInfo
-  if actualHash != permittedEntry.statementHash then
-    throwError (statementHashMismatchMessage declName permittedEntry actualHash)
-
-/--
-手动注册 attribute，而不是直接使用 `register_label_attr`。
-
-这里要先做无参数检查、target/permitted/hash 检查，因此不能直接用
-`register_label_attr`。
-
-使用 `public meta initialize`，确保导入方在 elaboration 阶段就能看到这条注册动作。
--/
-public meta initialize temporaryAxiomAttrInitialized : Unit ← do
-  let attrName : Name := `temporary_axiom
-  registerBuiltinAttribute {
-    name := attrName
-    descr := "mark a theorem declaration to be compiled as a temporary axiom after prepared-session validation"
-    applicationTime := AttributeApplicationTime.afterTypeChecking
-    add := fun declName stx _kind => do
-      ensureTemporaryAxiomNoArgs stx
-      -- 在声明完成类型检查时立即核验，因此非法标签会直接定位到本声明。
-      validateTemporaryAxiomTarget declName
-    erase := fun _declName => pure ()
-  }
+private meta def targetHashMismatchMessage
+    (declName : Name)
+    (expectedHash : UInt64)
+    (actualHash : UInt64) : MessageData :=
+  m!"Session target statement hash mismatch for {.ofConstName declName}\n
+Expected hash: {(expectedHash.toNat : Nat)}\n
+Actual hash:   {(actualHash.toNat : Nat)}\n
+Suggested fixes:\n
+- if the statement changed intentionally, re-run the session `prepare` command\n
+- otherwise inspect recent edits to the target theorem header"
 
 private meta def isTemporaryAxiomAttr (attrInstance : Syntax) : Bool :=
   if attrInstance.getKind != ``Parser.Term.attrInstance then
@@ -145,18 +96,128 @@ private meta def hasTemporaryAxiomAttr (modifiers : Syntax) : Bool :=
       let attrs := attrsOpt[0][1].getSepArgs
       attrs.any isTemporaryAxiomAttr
 
-/--
-把带有 `@[temporary_axiom]` 的 theorem 声明头改写成 axiom 声明头。
+private meta def buildAxiomizedDeclaration
+    (modifiers : TSyntax ``Parser.Command.declModifiers)
+    (declId : TSyntax ``Parser.Command.declId)
+    (declSig : TSyntax ``Parser.Command.declSig) : MacroM Syntax :=
+  `(command| $modifiers:declModifiers axiom $declId:declId $declSig:declSig)
 
-这里只丢弃证明体，不重建 binder 或 universe 细节，尽量复用 Lean 自身的
-`axiom` elaborator，减少宏层面的语义偏差。这里使用 `macro_rules`，避免继续
-依赖较底层的 `@[macro Parser.Command.declaration]` 挂接方式。
--/
-macro_rules (kind := Lean.Parser.Command.declaration)
-  | `($modifiers:declModifiers theorem $declId:declId $declSig:declSig $_:declVal) => do
-      if !hasTemporaryAxiomAttr modifiers then
-        Macro.throwUnsupported
-      -- 仅替换声明关键字，保留原始声明头，让 Lean 原生机制继续处理所有细节。
-      `(command| $modifiers:declModifiers axiom $declId:declId $declSig:declSig)
+private structure ResolvedTheoremDecl where
+  modifiers : Modifiers
+  decl : Syntax
+  declId : TSyntax ``Parser.Command.declId
+  declSig : TSyntax ``Parser.Command.declSig
+  declName : Name
+  userDeclName : Name
+
+private meta def resolveTheoremDecl (stx : Syntax) : CommandElabM ResolvedTheoremDecl := do
+  let modifiersStx : TSyntax ``Parser.Command.declModifiers := ⟨stx[0]⟩
+  let decl := stx[1]
+  let declId : TSyntax ``Parser.Command.declId := ⟨decl[1]⟩
+  let declSig : TSyntax ``Parser.Command.declSig := ⟨decl[2]⟩
+  let modifiers ← elabModifiers modifiersStx
+  let declName ← runTermElabM fun _ => do
+    let scopeLevelNames ← Term.getLevelNames
+    let ⟨_, declName, _, _⟩ ←
+      Term.expandDeclId (← getCurrNamespace) scopeLevelNames declId modifiers
+    pure declName
+  return {
+    modifiers := modifiers
+    decl := decl
+    declId := declId
+    declSig := declSig
+    declName := declName
+    userDeclName := userVisibleDeclName declName
+  }
+
+private meta def elaborateTheoremHeaderHash
+    (resolved : ResolvedTheoremDecl) : CommandElabM UInt64 := do
+  let decl := resolved.decl
+  let modifiers := resolved.modifiers
+  let declId := resolved.declId
+  let declSig := resolved.declSig
+  let (binders, typeStx) := expandDeclSig declSig.raw
+  runTermElabM fun vars => do
+    let scopeLevelNames ← Term.getLevelNames
+    let ⟨shortName, declName, allUserLevelNames, _⟩ ←
+      Term.expandDeclId (← getCurrNamespace) scopeLevelNames declId modifiers
+    addDeclarationRangesForBuiltin declName modifiers.stx decl
+    Term.withAutoBoundImplicitForbiddenPred (fun n => shortName == n) do
+      Term.withDeclName declName <|
+        Term.withLevelNames allUserLevelNames <|
+        Term.elabBinders binders.getArgs fun xs => do
+          let type ← Term.elabType typeStx
+          Term.synthesizeSyntheticMVarsNoPostponing
+          let xs ← Term.addAutoBoundImplicits xs (declId.raw.getTailPos? (canonicalOnly := true))
+          let type ← instantiateMVars type
+          let type ← Meta.mkForallFVars xs type
+          let type ← Meta.mkForallFVars vars type (usedOnly := true)
+          let type ← Term.levelMVarToParam type
+          let usedParams := collectLevelParams {} type |>.params
+          let levelParams ← match sortDeclLevelParams scopeLevelNames allUserLevelNames usedParams with
+            | Except.ok params => pure params
+            | Except.error msg => throwErrorAt decl msg
+          let type ← instantiateMVars type
+          return TemporaryAxiomTool.statementHash levelParams type
+
+private meta def validateTemporaryAxiomAttrTarget (declName : Name) : AttrM Unit := do
+  let runtimeDeclName := userVisibleDeclName declName
+  let frozenTargetName ← targetName
+  if frozenTargetName == Name.anonymous then
+    throwError (noActiveSessionMessage runtimeDeclName)
+  if runtimeDeclName == frozenTargetName then
+    throwError (targetTheoremTaggedMessage runtimeDeclName)
+  let permittedEntry ← match (← permittedTheoremFor? runtimeDeclName) with
+    | some entry => pure entry
+    | none => throwError (declarationNotPermittedMessage runtimeDeclName)
+  let constInfo ← getConstInfo declName
+  let actualHash := TemporaryAxiomTool.statementHashOfConstInfo constInfo
+  if actualHash != permittedEntry.statementHash then
+    throwError (statementHashMismatchMessage runtimeDeclName permittedEntry.statementHash actualHash)
+
+public meta initialize temporaryAxiomAttrInitialized : Unit ← do
+  let attrName : Name := `temporary_axiom
+  registerBuiltinAttribute {
+    name := attrName
+    descr := "mark a theorem declaration to be compiled as a temporary axiom after session validation"
+    applicationTime := AttributeApplicationTime.afterTypeChecking
+    add := fun declName stx _kind => do
+      ensureTemporaryAxiomNoArgs stx
+      validateTemporaryAxiomAttrTarget declName
+    erase := fun _declName => pure ()
+  }
+
+@[command_elab declaration]
+public meta def elabTrackedTheoremDeclaration : CommandElab := fun stx => do
+  let decl := stx[1]
+  if decl.getKind != ``Parser.Command.theorem then
+    throwUnsupportedSyntax
+  if !(← liftCoreM hasActiveSession) then
+    throwUnsupportedSyntax
+  let resolved ← resolveTheoremDecl stx
+  let explicitTemporaryAxiom := hasTemporaryAxiomAttr stx[0]
+  let frozenTargetName ← liftCoreM targetName
+  let permittedEntry? ← liftCoreM <| permittedTheoremFor? resolved.userDeclName
+  let isTarget := resolved.userDeclName == frozenTargetName
+  if !isTarget && permittedEntry?.isNone then
+    if explicitTemporaryAxiom then
+      throwError (declarationNotPermittedMessage resolved.userDeclName)
+    throwUnsupportedSyntax
+  if isTarget && explicitTemporaryAxiom then
+    throwError (targetTheoremTaggedMessage resolved.userDeclName)
+  let actualHash ← elaborateTheoremHeaderHash resolved
+  if isTarget then
+    let expectedHash ← liftCoreM targetHash
+    if actualHash != expectedHash then
+      throwError (targetHashMismatchMessage resolved.userDeclName expectedHash actualHash)
+    Command.elabDeclaration stx
+  else
+    let some permittedEntry := permittedEntry?
+      | throwUnsupportedSyntax
+    if actualHash != permittedEntry.statementHash then
+      throwError (statementHashMismatchMessage resolved.userDeclName permittedEntry.statementHash actualHash)
+    let axiomStx ← liftMacroM <|
+      buildAxiomizedDeclaration ⟨stx[0]⟩ resolved.declId resolved.declSig
+    Command.elabDeclaration axiomStx
 
 end TemporaryAxiomTool

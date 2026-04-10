@@ -1,5 +1,8 @@
 module
 
+import TemporaryAxiomTool
+import TemporaryAxiomTool.TheoremRegistry.Shards.TemporaryAxiomTool.TestFixture.ComplexAttr
+
 namespace TemporaryAxiomTool.TestFixture.ComplexAttr
 
 /-- The helper carries a tail comment on its attribute line. -/

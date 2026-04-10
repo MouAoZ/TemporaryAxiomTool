@@ -1,5 +1,8 @@
 module
 
+import TemporaryAxiomTool
+import TemporaryAxiomTool.TheoremRegistry.Shards.TemporaryAxiomTool.TestFixture.DepA
+
 namespace TemporaryAxiomTool.TestFixture.DepA
 
 public theorem dep_sorry : True := by
