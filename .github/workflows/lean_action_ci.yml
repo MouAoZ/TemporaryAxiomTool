@@ -18,7 +18,8 @@ jobs:
         run: |
           lake build TemporaryAxiomTool TemporaryAxiomTool.TestFixture.Target
           python3 scripts/temporary_axiom_session.py prepare \
-            --target TemporaryAxiomTool.TestFixture.Target.goal
+            --target TemporaryAxiomTool.TestFixture.Target.goal \
+            --auto-build
           lake build TemporaryAxiomTool.TestFixture.Target
           python3 scripts/temporary_axiom_session.py cleanup
           lake build TemporaryAxiomTool.TestFixture.Target
