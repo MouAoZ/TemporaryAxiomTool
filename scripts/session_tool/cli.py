@@ -4,7 +4,6 @@ import argparse
 import json
 import os
 import re
-import tempfile
 from collections import defaultdict, deque
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
@@ -18,7 +17,6 @@ from .common import (
     TOOL_TEMPORARY_AXIOM_MODULE,
     TOOL_THEOREM_REGISTRY_MODULE,
     TOOL_THEOREM_REGISTRY_SHARDS_MODULE_PREFIX,
-    TOOL_THEOREM_REGISTRY_TYPES_MODULE,
     acquire_prepare_lock,
     ensure_layout,
     fail,
@@ -33,7 +31,7 @@ from .common import (
 )
 from .lean_ops import (
     build_module,
-    compile_importable_lean_module_with_result,
+    compile_importable_lean_module,
     compute_text_file_hashes,
     ensure_probe_tool_ready,
     generated_shard_module_source,
@@ -41,6 +39,7 @@ from .lean_ops import (
     lean_string_literal,
     module_artifact_path,
     run_command,
+    run_lean_module_file,
     run_lean_module_source,
     run_lean_probe,
     try_git_head,
@@ -522,14 +521,6 @@ def direct_host_imports_from_source(paths, module_name: str) -> tuple[str, ...]:
     )
 
 
-def normalize_replay_host_imports(imports: tuple[str, ...] | list[str]) -> tuple[str, ...]:
-    return tuple(
-        imported
-        for imported in imports
-        if not imported.startswith(TOOL_THEOREM_REGISTRY_SHARDS_MODULE_PREFIX + ".")
-    )
-
-
 def source_host_module_closure(
     paths,
     root_module: str,
@@ -955,14 +946,7 @@ def build_collect_replay_source(
     module_name: str,
     module_entries: list[dict[str, object]],
 ) -> str:
-    del module_entries
-    source = module_source_text(paths, module_name)
-    shard_import = generated_shard_runtime_module_name(module_name)
-    if shard_import in direct_imports_from_source(paths, module_name):
-        return source
-    insertion_offset = module_header_insertion_offset(paths, module_name)
-    import_line = f"import {shard_import}\n"
-    return source[:insertion_offset] + import_line + source[insertion_offset:]
+    return module_source_text(paths, module_name)
 
 
 def build_collect_replay_payload(module_entries: list[dict[str, object]]) -> str:
@@ -1310,232 +1294,70 @@ def merge_module_lists(*module_lists: list[str]) -> list[str]:
     return merged
 
 
-def expected_replay_source_hash(
+def collect_module_theorems_by_local_replay(
     paths,
     *,
     module_name: str,
-    prepare_start_source_hashes: dict[str, str],
-    current_source_hashes: dict[str, str],
-) -> str:
-    expected_hash = prepare_start_source_hashes.get(module_name)
-    if expected_hash is not None:
-        return expected_hash
-    cached = current_source_hashes.get(module_name)
-    if cached is not None:
-        return cached
-    source_path = module_name_to_path(paths.project_root, module_name).resolve()
-    raw_hashes = compute_text_file_hashes(paths, [source_path])
-    expected_hash = raw_hashes[source_path]
-    current_source_hashes[module_name] = expected_hash
-    return expected_hash
-
-
-def project_artifacts_reliable_for_local_replay(
-    paths,
-    *,
-    module_name: str,
-    prepare_start_source_hashes: dict[str, str],
-    current_source_hashes: dict[str, str],
-) -> bool:
-    ilean_path = ilean_path_for_module(paths, module_name)
-    olean_path = olean_path_for_module(paths, module_name)
-    trace_path = trace_path_for_module(paths, module_name)
-    if not ilean_path.exists() or not olean_path.exists() or not trace_path.exists():
-        return False
-    metadata = load_ilean_metadata(paths, module_name)
-    metadata_imports = normalize_replay_host_imports(
-        tuple(direct_host_imports_from_metadata(paths, metadata))
-    )
-    source_imports = normalize_replay_host_imports(direct_host_imports_from_source(paths, module_name))
-    if metadata_imports != source_imports:
-        return False
-    recorded_source_hash = trace_source_hash(paths, module_name)
-    if recorded_source_hash is None:
-        return False
-    return recorded_source_hash == expected_replay_source_hash(
-        paths,
-        module_name=module_name,
-        prepare_start_source_hashes=prepare_start_source_hashes,
-        current_source_hashes=current_source_hashes,
-    )
-
-
-def collect_modules_by_local_replay(
-    paths,
-    *,
-    replay_modules: list[str],
-    prepare_start_source_hashes: dict[str, str],
 ) -> list[dict[str, object]]:
-    ordered_modules = dependency_first_module_order(paths, replay_modules)
-    if not ordered_modules:
-        return []
-    with tempfile.TemporaryDirectory(prefix="TemporaryAxiomToolReplayBatch_", dir=paths.project_root) as temp_root_name:
-        temp_root = Path(temp_root_name)
-        compiled_modules: set[str] = set()
-        compiled_shards: set[str] = set()
-        overlaid_project_modules: set[str] = set()
-        tool_overlay_ready = False
-        payloads_by_module: dict[str, list[dict[str, object]]] = {}
-        project_artifact_reliability: dict[str, bool] = {}
-        current_source_hashes: dict[str, str] = {}
-
-        def project_artifacts_reliable(module_name: str) -> bool:
-            cached = project_artifact_reliability.get(module_name)
-            if cached is not None:
-                return cached
-            reliable = project_artifacts_reliable_for_local_replay(
-                paths,
-                module_name=module_name,
-                prepare_start_source_hashes=prepare_start_source_hashes,
-                current_source_hashes=current_source_hashes,
-            )
-            project_artifact_reliability[module_name] = reliable
-            return reliable
-
-        def ensure_tool_overlay() -> None:
-            nonlocal tool_overlay_ready
-            if tool_overlay_ready:
-                return
-            tool_modules = [
-                TOOL_ROOT_MODULE,
-                f"{TOOL_ROOT_MODULE}.StatementHash",
-                TOOL_THEOREM_REGISTRY_MODULE,
-                TOOL_THEOREM_REGISTRY_TYPES_MODULE,
-                TOOL_TEMPORARY_AXIOM_MODULE,
-            ]
-            for tool_module_name in tool_modules:
-                for suffix in (".olean", ".ilean", ".ir"):
-                    source_artifact = module_artifact_path(paths, tool_module_name, suffix)
-                    if not source_artifact.exists():
-                        fail(
-                            "本地 collect replay 缺少工具模块产物。",
-                            details=[
-                                f"模块：`{tool_module_name}`",
-                                f"缺少：`{relative_path_str(paths.project_root, source_artifact)}`",
-                            ],
-                            hints=[f"先运行 `lake build {paths.build_target}`。"],
-                        )
-                    target_artifact = temp_root / module_name_to_relative_path(tool_module_name).with_suffix(suffix)
-                    target_artifact.parent.mkdir(parents=True, exist_ok=True)
-                    target_artifact.write_bytes(source_artifact.read_bytes())
-            tool_overlay_ready = True
-
-        def ensure_project_artifact_overlay(module_name: str) -> None:
-            if module_name in overlaid_project_modules or module_name in compiled_modules:
-                return
-            if not project_artifacts_reliable(module_name):
-                ensure_compiled(module_name)
-                return
-            for imported in direct_host_imports_from_source(paths, module_name):
-                if project_artifacts_reliable(imported):
-                    ensure_project_artifact_overlay(imported)
-                else:
-                    ensure_compiled(imported)
-            for suffix in (".olean", ".ilean"):
-                source_artifact = module_artifact_path(paths, module_name, suffix)
-                target_artifact = temp_root / module_name_to_relative_path(module_name).with_suffix(suffix)
-                target_artifact.parent.mkdir(parents=True, exist_ok=True)
-                target_artifact.write_bytes(source_artifact.read_bytes())
-            ir_artifact = module_artifact_path(paths, module_name, ".ir")
-            if ir_artifact.exists():
-                target_ir_artifact = temp_root / module_name_to_relative_path(module_name).with_suffix(".ir")
-                target_ir_artifact.parent.mkdir(parents=True, exist_ok=True)
-                target_ir_artifact.write_bytes(ir_artifact.read_bytes())
-            overlaid_project_modules.add(module_name)
-
-        def ensure_collect_shard(module_name: str) -> None:
-            if module_name in compiled_shards:
-                return
-            ensure_tool_overlay()
-            shard_module_name = generated_shard_runtime_module_name(module_name)
-            shard_source_path = temp_root / module_name_to_relative_path(shard_module_name)
-            shard_source_path.parent.mkdir(parents=True, exist_ok=True)
-            shard_source_path.write_text(
-                generated_shard_module_source(
-                    module_name=module_name,
-                    mode="collect",
-                    target_decl=None,
-                    target_hash=None,
-                    permitted_axioms=[],
-                ),
-                encoding="utf-8",
-            )
-            result, _, _ = compile_importable_lean_module_with_result(
-                paths,
-                source_path=shard_source_path,
-                module_name=shard_module_name,
-                description=f"编译 collect shard `{shard_module_name}`",
-                output_root=temp_root,
-                allow_failure=True,
-                prepend_lean_paths=[temp_root],
-                root=temp_root,
-            )
-            if result.returncode != 0:
-                output = "\n".join(part for part in [result.stdout.strip(), result.stderr.strip()] if part)
-                fail(
-                    "本地 collect replay 的 shard 编译失败。",
-                    details=[
-                        f"模块：`{module_name}`",
-                        f"shard：`{shard_module_name}`",
-                        "输出：\n" + (output or "<空>"),
-                    ],
-                )
-            compiled_shards.add(module_name)
-
-        def ensure_compiled(module_name: str) -> None:
-            if module_name in compiled_modules:
-                return
-            for imported in direct_host_imports_from_source(paths, module_name):
-                if imported in compiled_modules or imported in overlaid_project_modules:
-                    continue
-                if project_artifacts_reliable(imported):
-                    ensure_project_artifact_overlay(imported)
-                else:
-                    ensure_compiled(imported)
-            ensure_collect_shard(module_name)
-            source_path = temp_root / module_name_to_relative_path(module_name)
-            source_path.parent.mkdir(parents=True, exist_ok=True)
-            source_path.write_text(
-                build_collect_replay_source(paths, module_name=module_name, module_entries=[]),
-                encoding="utf-8",
-            )
-            result, _, _ = compile_importable_lean_module_with_result(
-                paths,
-                source_path=source_path,
-                module_name=module_name,
-                description=f"重放 `{module_name}` 并收集 theorem-side hash",
-                output_root=temp_root,
-                allow_failure=True,
-                prepend_lean_paths=[temp_root],
-                root=temp_root,
-            )
-            if result.returncode != 0:
-                output = "\n".join(part for part in [result.stdout.strip(), result.stderr.strip()] if part)
-                fail(
-                    "模块内本地 collect replay 失败。",
-                    details=[
-                        f"模块：`{module_name}`",
-                        "输出：\n" + (output or "<空>"),
-                    ],
-                )
-            payloads_by_module[module_name] = parse_json_payload_lines(result.stdout, result.stderr)
-            compiled_modules.add(module_name)
-
-        for module_name in ordered_modules:
-            ensure_compiled(module_name)
+    shard_source = generated_shard_module_source(
+        module_name=module_name,
+        mode="collect",
+        target_decl=None,
+        target_hash=None,
+        permitted_axioms=[],
+    )
+    shard_module_name = generated_shard_runtime_module_name(module_name)
+    shard_path = paths.project_root / module_name_to_relative_path(generated_shard_runtime_module_name(module_name))
+    shard_artifact_base = paths.lean_build_lib_root / module_name_to_relative_path(shard_module_name).with_suffix("")
+    original_shard_source = shard_path.read_text(encoding="utf-8") if shard_path.exists() else None
+    hidden_artifacts: list[tuple[Path, Path]] = []
+    ensure_layout(paths)
+    try:
+        if original_shard_source != shard_source:
+            shard_path.parent.mkdir(parents=True, exist_ok=True)
+            shard_path.write_text(shard_source, encoding="utf-8")
+        for artifact_path in sorted(shard_artifact_base.parent.glob(shard_artifact_base.name + ".*")):
+            hidden_path = artifact_path.with_name(artifact_path.name + ".temporary_axiom_replay_backup")
+            artifact_path.rename(hidden_path)
+            hidden_artifacts.append((artifact_path, hidden_path))
+        compile_importable_lean_module(
+            paths,
+            source_path=shard_path,
+            module_name=shard_module_name,
+            description=f"编译 collect shard `{shard_module_name}`",
+        )
+        result, _ = run_lean_module_file(
+            paths,
+            module_path=module_name_to_path(paths.project_root, module_name),
+            description=f"重放 `{module_name}` 并收集 theorem-side hash",
+            allow_failure=True,
+        )
+    finally:
+        for artifact_path, hidden_path in reversed(hidden_artifacts):
+            if hidden_path.exists():
+                hidden_path.rename(artifact_path)
+        if original_shard_source is None:
+            shard_path.unlink(missing_ok=True)
+        elif shard_path.read_text(encoding="utf-8") != original_shard_source:
+            shard_path.write_text(original_shard_source, encoding="utf-8")
+    if result.returncode != 0:
+        output = "\n".join(part for part in [result.stdout.strip(), result.stderr.strip()] if part)
+        fail(
+            "tracked 模块的本地 collect replay 失败。",
+            details=[
+                f"模块：`{module_name}`",
+                "输出：\n" + (output or "<空>"),
+            ],
+        )
     collected_by_key: dict[tuple[str, str], dict[str, object]] = {}
-    replay_module_set = {str(module_name) for module_name in ordered_modules}
-    for module_name in ordered_modules:
-        for payload in payloads_by_module.get(module_name, []):
-            if str(payload.get("kind", "")) != COLLECT_PAYLOAD_KIND:
-                continue
-            payload_module = str(payload.get("module", ""))
-            if payload_module not in replay_module_set:
-                continue
-            if payload_module != module_name:
-                continue
-            normalized = normalize_collected_decl(paths, payload)
-            collected_by_key[(str(normalized["module"]), str(normalized["decl_name"]))] = normalized
+    for payload in parse_json_payload_lines(result.stdout, result.stderr):
+        if str(payload.get("kind", "")) != COLLECT_PAYLOAD_KIND:
+            continue
+        payload_module = str(payload.get("module", ""))
+        if payload_module != module_name:
+            continue
+        normalized = normalize_collected_decl(paths, payload)
+        collected_by_key[(str(normalized["module"]), str(normalized["decl_name"]))] = normalized
     return sorted(
         collected_by_key.values(),
         key=lambda item: (str(item["module"]), int(item["ordinal"]), str(item["decl_name"])),
@@ -1546,13 +1368,17 @@ def collect_tracked_theorems_by_local_replay(
     paths,
     *,
     replay_modules: list[str],
-    prepare_start_source_hashes: dict[str, str],
 ) -> list[dict[str, object]]:
-    return collect_modules_by_local_replay(
-        paths,
-        replay_modules=replay_modules,
-        prepare_start_source_hashes=prepare_start_source_hashes,
-    )
+    ordered_modules = dependency_first_module_order(paths, replay_modules)
+    collected_entries: list[dict[str, object]] = []
+    for module_name in ordered_modules:
+        collected_entries.extend(
+            collect_module_theorems_by_local_replay(
+                paths,
+                module_name=module_name,
+            )
+        )
+    return collected_entries
 
 
 def resolve_target_from_collected_entries(
@@ -1905,7 +1731,6 @@ def collect_session_temporary_axioms(
     tracked_modules: set[str],
     module_closure: list[str] | None = None,
     inserted_shard_import_modules_out: list[str] | None = None,
-    prepare_start_source_hashes: dict[str, str] | None = None,
 ) -> tuple[list[str], list[dict[str, object]], list[str]]:
     target_module = str(target_info["module"])
     closure = list(module_closure) if module_closure is not None else compute_module_closure(paths, target_module)
@@ -1922,16 +1747,6 @@ def collect_session_temporary_axioms(
         )
         if temporary_candidates:
             temporary_candidates_by_module[module_name] = temporary_candidates
-    if prepare_start_source_hashes is not None:
-        missing_snapshot_modules = [
-            module_name
-            for module_name in sorted(temporary_candidates_by_module)
-            if module_name not in prepare_start_source_hashes
-        ]
-        if missing_snapshot_modules:
-            prepare_start_source_hashes.update(
-                collect_registry_source_hashes(paths, missing_snapshot_modules)
-            )
     inserted_shard_import_modules = ensure_shard_imports(paths, sorted(temporary_candidates_by_module))
     if inserted_shard_import_modules_out is not None:
         for module_name in inserted_shard_import_modules:
@@ -1939,13 +1754,7 @@ def collect_session_temporary_axioms(
                 inserted_shard_import_modules_out.append(module_name)
     temporary_entries: list[dict[str, object]] = []
     for module_name, temporary_candidates in sorted(temporary_candidates_by_module.items()):
-        collected_entries = collect_modules_by_local_replay(
-            paths,
-            replay_modules=[module_name],
-            prepare_start_source_hashes=(
-                prepare_start_source_hashes if prepare_start_source_hashes is not None else {}
-            ),
-        )
+        collected_entries = collect_module_theorems_by_local_replay(paths, module_name=module_name)
         collected_by_decl_name = {
             str(entry["decl_name"]): entry
             for entry in collected_entries
@@ -2392,15 +2201,15 @@ def prepare_session(args: argparse.Namespace, paths) -> None:
                     "只有直接导入 TemporaryAxiomTool 的项目模块，才会在 session 中启用 theorem registry。",
                 ],
             )
-        prepare_start_source_hashes = collect_registry_source_hashes(paths, current_tracked_modules)
         inserted_shard_import_modules = ensure_stable_shard_imports(paths, current_tracked_modules)
         registry_db = load_registry_db(paths)
+        current_source_hashes = collect_registry_source_hashes(paths, current_tracked_modules)
         dirty_modules = {str(module_name) for module_name in registry_db.get("dirty_modules", [])}
         changed_tracked_modules = [
             module_name
             for module_name in current_tracked_modules
             if (
-                registry_db.get("module_digests", {}).get(module_name) != prepare_start_source_hashes[module_name]
+                registry_db.get("module_digests", {}).get(module_name) != current_source_hashes[module_name]
                 or module_name in dirty_modules
             )
         ]
@@ -2477,7 +2286,6 @@ def prepare_session(args: argparse.Namespace, paths) -> None:
             collected_entries = collect_tracked_theorems_by_local_replay(
                 paths,
                 replay_modules=collect_modules,
-                prepare_start_source_hashes=prepare_start_source_hashes,
             )
         else:
             collected_entries = []
@@ -2499,7 +2307,6 @@ def prepare_session(args: argparse.Namespace, paths) -> None:
             replayed_entries = collect_tracked_theorems_by_local_replay(
                 paths,
                 replay_modules=replay_modules,
-                prepare_start_source_hashes=prepare_start_source_hashes,
             )
         else:
             replay_modules = []
@@ -2537,7 +2344,7 @@ def prepare_session(args: argparse.Namespace, paths) -> None:
         updated_registry_db = refresh_registry_for_modules_from_collect(
             registry_db,
             modules=changed_tracked_modules,
-            digests_by_module=prepare_start_source_hashes,
+            digests_by_module=current_source_hashes,
             collected_entries=collected_entries,
             tracked_modules=current_tracked_modules,
             clear_dirty_modules=True,
@@ -2571,7 +2378,6 @@ def prepare_session(args: argparse.Namespace, paths) -> None:
             tracked_modules=set(current_tracked_modules),
             module_closure=target_closure,
             inserted_shard_import_modules_out=transient_shard_import_modules,
-            prepare_start_source_hashes=prepare_start_source_hashes,
         )
         session_temporary_axioms = merge_session_temporary_axioms(
             tracked_session_temporary_axioms,

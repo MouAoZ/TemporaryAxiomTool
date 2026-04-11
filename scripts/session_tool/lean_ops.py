@@ -414,56 +414,17 @@ def compile_importable_lean_module(
     module_name: str,
     description: str,
 ) -> tuple[Path, Path]:
-    _, olean_path, ilean_path = compile_importable_lean_module_with_result(
+    lean_cmd, lean_env = lean_command_configuration(paths)
+    olean_path = module_artifact_path(paths, module_name, ".olean")
+    ilean_path = module_artifact_path(paths, module_name, ".ilean")
+    olean_path.parent.mkdir(parents=True, exist_ok=True)
+    run_command(
         paths,
-        source_path=source_path,
-        module_name=module_name,
-        description=description,
+        [*lean_cmd, str(source_path), "-o", str(olean_path), "-i", str(ilean_path)],
+        description,
+        env=lean_env,
     )
     return olean_path, ilean_path
-
-
-def compile_importable_lean_module_with_result(
-    paths,
-    *,
-    source_path: Path,
-    module_name: str,
-    description: str,
-    output_root: Path | None = None,
-    allow_failure: bool = False,
-    env: dict[str, str] | None = None,
-    prepend_lean_paths: list[Path] | None = None,
-    root: Path | None = None,
-) -> tuple[subprocess.CompletedProcess[str], Path, Path]:
-    lean_cmd, lean_env = lean_command_configuration(paths)
-    artifact_root = output_root if output_root is not None else paths.lean_build_lib_root
-    relative_module_path = module_name_to_relative_path(module_name)
-    olean_path = artifact_root / relative_module_path.with_suffix(".olean")
-    ilean_path = artifact_root / relative_module_path.with_suffix(".ilean")
-    olean_path.parent.mkdir(parents=True, exist_ok=True)
-    effective_env = None if lean_env is None else dict(lean_env)
-    if env is not None:
-        if effective_env is None:
-            effective_env = dict(os.environ)
-        effective_env.update(env)
-    if prepend_lean_paths:
-        if effective_env is None:
-            effective_env = dict(os.environ)
-        existing_lean_path = effective_env.get("LEAN_PATH", "")
-        prefix = ":".join(str(path) for path in prepend_lean_paths)
-        effective_env["LEAN_PATH"] = f"{prefix}:{existing_lean_path}" if existing_lean_path else prefix
-    args = [*lean_cmd]
-    if root is not None:
-        args.append(f"--root={root}")
-    args.extend([str(source_path), "-o", str(olean_path), "-i", str(ilean_path)])
-    result = run_command(
-        paths,
-        args,
-        description,
-        allow_failure=allow_failure,
-        env=effective_env,
-    )
-    return result, olean_path, ilean_path
 
 
 def run_lean_probe(
