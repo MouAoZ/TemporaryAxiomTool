@@ -498,7 +498,7 @@ def generated_shard_module_source(
         "Auto-generated theorem-registry shard.\n"
         "This file is managed by TemporaryAxiomTool.\n"
         "-/\n"
-        f"import {TOOL_THEOREM_REGISTRY_MODULE}\n\n"
+        f"public import {TOOL_ROOT_MODULE}\n\n"
         f"#register_temporary_axiom_module_shard "
         f"{lean_string_literal(module_name)} "
         f"{lean_string_literal(mode)} "
@@ -600,7 +600,6 @@ def write_collect_shards(
         target_hash=None,
         permitted_axioms=[],
     )
-
 
 def write_active_shards(
     paths,

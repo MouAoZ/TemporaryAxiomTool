@@ -65,7 +65,7 @@ DECL_MODIFIER_TOKENS = {
     "scoped",
 }
 REGISTRY_SCHEMA_VERSION = 2
-SESSION_SCHEMA_VERSION = 4
+SESSION_SCHEMA_VERSION = 5
 MAX_PROBE_WORKERS = 4
 COLLECT_PAYLOAD_KIND = "temporary_axiom_collect"
 
@@ -1569,6 +1569,38 @@ def discover_tracked_modules(paths) -> list[str]:
     return tracked
 
 
+def find_stale_transient_shard_import_modules(paths, tracked_modules: list[str]) -> list[str]:
+    tracked_set = {str(module_name) for module_name in tracked_modules}
+    stale_modules: list[str] = []
+    excluded_roots = {
+        ".git",
+        ".lake",
+        ".temporary_axiom_session",
+        ".temporary_axiom_registry",
+        "docs",
+    }
+    for path in sorted(paths.project_root.rglob("*.lean")):
+        try:
+            relative = path.relative_to(paths.project_root)
+        except ValueError:
+            continue
+        if not relative.parts:
+            continue
+        if relative.parts[0] in excluded_roots:
+            continue
+        if path.is_relative_to(paths.generated_shards_root):
+            continue
+        module_name = path_to_module_name(paths.project_root, path)
+        if not is_session_host_module(paths, module_name):
+            continue
+        if module_name in tracked_set:
+            continue
+        imports = direct_imports_from_source(paths, module_name)
+        if generated_shard_runtime_module_name(module_name) in imports:
+            stale_modules.append(module_name)
+    return stale_modules
+
+
 def collect_registry_source_hashes(paths, modules: list[str]) -> dict[str, str]:
     source_paths = [module_name_to_path(paths.project_root, module_name).resolve() for module_name in modules]
     raw_hashes = compute_text_file_hashes(paths, source_paths)
@@ -1738,10 +1770,11 @@ def collect_session_temporary_axioms(
     target_info: dict[str, object],
     tracked_modules: set[str],
     module_closure: list[str] | None = None,
-) -> tuple[list[str], list[dict[str, object]]]:
+    inserted_shard_import_modules_out: list[str] | None = None,
+) -> tuple[list[str], list[dict[str, object]], list[str]]:
     target_module = str(target_info["module"])
     closure = list(module_closure) if module_closure is not None else compute_module_closure(paths, target_module)
-    temporary_entries: list[dict[str, object]] = []
+    temporary_candidates_by_module: dict[str, list[dict[str, object]]] = {}
     for module_name in closure:
         if module_name in tracked_modules:
             continue
@@ -1752,40 +1785,52 @@ def collect_session_temporary_axioms(
             include_proved=False,
             include_sorry=True,
         )
-        if not temporary_candidates:
-            continue
-        context_entries = scan_all_theorem_like_entries(
-            paths,
-            module_name,
-            before_entry=target_info if module_name == target_module else None,
-        )
-        if module_entries_require_local_replay(context_entries):
-            temporary_entries.extend(
-                select_hashed_entries(
-                    collect_decl_entries_via_replay(
-                        paths,
-                        module_name=module_name,
-                        module_entries=context_entries,
-                        description_prefix="重放模块并探测 session temporary theorem 的 theorem-side statement hash in",
-                    ),
-                    temporary_candidates,
-                )
+        if temporary_candidates:
+            temporary_candidates_by_module[module_name] = temporary_candidates
+    inserted_shard_import_modules = ensure_shard_imports(paths, sorted(temporary_candidates_by_module))
+    if inserted_shard_import_modules_out is not None:
+        for module_name in inserted_shard_import_modules:
+            if module_name not in inserted_shard_import_modules_out:
+                inserted_shard_import_modules_out.append(module_name)
+    temporary_entries: list[dict[str, object]] = []
+    for module_name, temporary_candidates in sorted(temporary_candidates_by_module.items()):
+        collected_entries = collect_module_theorems_by_local_replay(paths, module_name=module_name)
+        collected_by_decl_name = {
+            str(entry["decl_name"]): entry
+            for entry in collected_entries
+            if bool(entry.get("explicit_sorry", False))
+        }
+        missing = [
+            str(entry["decl_name"])
+            for entry in temporary_candidates
+            if str(entry["decl_name"]) not in collected_by_decl_name
+        ]
+        if missing:
+            preview = "\n".join(f"- {decl_name}" for decl_name in missing[:10])
+            fail(
+                "untracked 模块的本地 collect replay 未返回全部 session temporary theorem。",
+                details=[
+                    f"模块：`{module_name}`",
+                    "缺失声明：\n" + preview,
+                ],
             )
-        else:
-            temporary_entries.extend(
-                collect_decl_entries_via_import_probe(
-                    paths,
-                    module_name=module_name,
-                    module_entries=temporary_candidates,
-                    description_prefix="探测 session temporary theorem 的 theorem-side statement hash in",
-                )
+        for candidate in temporary_candidates:
+            entry = collected_by_decl_name[str(candidate["decl_name"])]
+            temporary_entries.append(
+                {
+                    "decl_name": str(entry["decl_name"]),
+                    "module": str(entry["module"]),
+                    "file": str(entry["file"]),
+                    "statement_hash": str(entry["statement_hash"]),
+                    "origin": "session_temporary",
+                }
             )
     for entry in temporary_entries:
         entry["origin"] = "session_temporary"
     return closure, sorted(
         temporary_entries,
-        key=lambda item: (str(item["module"]), int(item["range"]["line"]), int(item["range"]["column"]), str(item["decl_name"])),
-    )
+        key=lambda item: (str(item["module"]), str(item["decl_name"])),
+    ), inserted_shard_import_modules
 
 
 def merge_permitted_axioms(
@@ -1868,9 +1913,9 @@ def write_lines(path: Path, lines: list[str]) -> None:
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
-def ensure_stable_shard_imports(paths, tracked_modules: list[str]) -> list[str]:
+def ensure_shard_imports(paths, modules: list[str]) -> list[str]:
     changed_modules: list[str] = []
-    for module_name in tracked_modules:
+    for module_name in modules:
         path = module_name_to_path(paths.project_root, module_name)
         lines = path.read_text(encoding="utf-8").splitlines()
         import_module = generated_shard_runtime_module_name(module_name)
@@ -1879,6 +1924,32 @@ def ensure_stable_shard_imports(paths, tracked_modules: list[str]) -> list[str]:
         insert_idx = compute_import_insertion_index(lines)
         lines.insert(insert_idx, f"import {import_module}")
         write_lines(path, lines)
+        changed_modules.append(module_name)
+    if changed_modules:
+        clear_module_metadata_caches()
+    return changed_modules
+
+
+def ensure_stable_shard_imports(paths, tracked_modules: list[str]) -> list[str]:
+    return ensure_shard_imports(paths, tracked_modules)
+
+
+def remove_transient_shard_imports(paths, modules: list[str]) -> list[str]:
+    changed_modules: list[str] = []
+    for module_name in modules:
+        path = module_name_to_path(paths.project_root, module_name)
+        lines = path.read_text(encoding="utf-8").splitlines()
+        import_line = f"import {generated_shard_runtime_module_name(module_name)}"
+        removed = False
+        filtered_lines: list[str] = []
+        for line in lines:
+            if not removed and line == import_line:
+                removed = True
+                continue
+            filtered_lines.append(line)
+        if not removed:
+            continue
+        write_lines(path, filtered_lines)
         changed_modules.append(module_name)
     if changed_modules:
         clear_module_metadata_caches()
@@ -1930,17 +2001,17 @@ def extract_session_tracked_modules(session_payload: dict[str, Any]) -> list[str
     return [str(module_name) for module_name in raw_modules]
 
 
-def extract_session_permitted_axioms(session_payload: dict[str, Any]) -> list[dict[str, str]]:
+def extract_session_session_temporary_axioms(session_payload: dict[str, Any]) -> list[dict[str, str]]:
     try:
-        raw_entries = session_payload["freeze"]["permitted_axioms"]
+        raw_entries = session_payload["freeze"]["session_temporary_axioms"]
     except (KeyError, TypeError):
-        fail("活动 session 文件缺少 `freeze.permitted_axioms` 字段。")
+        fail("活动 session 文件缺少 `freeze.session_temporary_axioms` 字段。")
     if not isinstance(raw_entries, list):
-        fail("活动 session 文件中的 `freeze.permitted_axioms` 不是数组。")
+        fail("活动 session 文件中的 `freeze.session_temporary_axioms` 不是数组。")
     entries: list[dict[str, str]] = []
     for item in raw_entries:
         if not isinstance(item, dict):
-            fail("活动 session 文件中的 permitted axioms 条目格式无效。")
+            fail("活动 session 文件中的 session temporary axioms 条目格式无效。")
         try:
             entries.append(
                 {
@@ -1951,8 +2022,48 @@ def extract_session_permitted_axioms(session_payload: dict[str, Any]) -> list[di
                 }
             )
         except KeyError:
-            fail("活动 session 文件中的 permitted axioms 条目缺少必要字段。")
+            fail("活动 session 文件中的 session temporary axioms 条目缺少必要字段。")
     return entries
+
+
+def extract_session_transient_shard_import_modules(session_payload: dict[str, Any]) -> list[str]:
+    raw_modules = session_payload.get("transient_shard_import_modules", [])
+    if not isinstance(raw_modules, list):
+        fail("活动 session 文件中的 `transient_shard_import_modules` 不是数组。")
+    return [str(module_name) for module_name in raw_modules]
+
+
+def permitted_axiom_decl_names(permitted_axioms: list[dict[str, object]]) -> list[str]:
+    return sorted({str(entry["decl_name"]) for entry in permitted_axioms})
+
+
+def session_untracked_temporary_modules(
+    *,
+    tracked_modules: list[str],
+    session_temporary_axioms: list[dict[str, object]],
+) -> list[str]:
+    tracked_module_set = {str(module_name) for module_name in tracked_modules}
+    return sorted(
+        {
+            str(entry["module"])
+            for entry in session_temporary_axioms
+            if str(entry["module"]) not in tracked_module_set
+        }
+    )
+
+
+def session_host_modules(
+    *,
+    tracked_modules: list[str],
+    session_temporary_axioms: list[dict[str, object]],
+) -> list[str]:
+    return merge_module_lists(
+        tracked_modules,
+        session_untracked_temporary_modules(
+            tracked_modules=tracked_modules,
+            session_temporary_axioms=session_temporary_axioms,
+        ),
+    )
 
 
 def group_permitted_axioms_by_module(
@@ -1983,6 +2094,7 @@ def session_report_text(
     tracked_modules = extract_session_tracked_modules(session_payload)
     module_closure = session_payload["freeze"]["module_closure"]
     session_temporaries = session_payload["freeze"]["session_temporary_axioms"]
+    permitted_axioms_list = session_payload["freeze"].get("permitted_axioms_list", [])
     lines = [
         "TemporaryAxiomTool prepared session report",
         "",
@@ -2010,6 +2122,12 @@ def session_report_text(
             lines.append(f"- {module_name} ({len(entries)})")
             for entry in entries:
                 lines.append(f"  - {entry['decl_name']} [{entry['origin']}]")
+    lines.append("")
+    lines.append("Comparator permitted_axioms_list")
+    if permitted_axioms_list:
+        lines.extend(json.dumps(permitted_axioms_list, ensure_ascii=False, indent=2).splitlines())
+    else:
+        lines.append("[]")
     lines.append("")
     lines.append("Artifacts")
     lines.append("- .temporary_axiom_session/session.json: freeze data for external tooling")
@@ -2045,6 +2163,7 @@ def print_prepare_summary(
     module_closure: list[str],
     grouped_permitted_axioms: dict[str, list[dict[str, str]]],
     session_temporary_count: int,
+    verification_status: str,
 ) -> None:
     permitted_count = sum(len(entries) for entries in grouped_permitted_axioms.values())
     print(f"Prepared session for `{target_info['decl_name']}`.")
@@ -2068,7 +2187,10 @@ def print_prepare_summary(
                     print(f"    - {entry['decl_name']} [{entry['origin']}]")
     else:
         print("- permitted axiom list is long; see the saved report for the full grouped list.")
-    print("- verification: completed via a final target-module build")
+    if verification_status == "completed":
+        print("- verification: completed via a final target-module build")
+    else:
+        print("- verification: skipped because the target module already passed collect build")
     print(f"- session data: {relative_path_str(paths.project_root, paths.session_file)}")
     print(f"- report: {relative_path_str(paths.project_root, paths.report_file)}")
     print(f"- proved registry DB: {relative_path_str(paths.project_root, paths.registry_db_file)}")
@@ -2095,10 +2217,25 @@ def prepare_session(args: argparse.Namespace, paths) -> None:
     acquire_prepare_lock(paths)
     updated_registry_db: dict[str, Any] | None = None
     current_tracked_modules: list[str] = []
+    transient_shard_import_modules: list[str] = []
+    active_session_host_modules: list[str] = []
     try:
         assert_no_active_session(paths)
         requested_target = parse_target_spec(args.target)
         current_tracked_modules = discover_tracked_modules(paths)
+        stale_transient_modules = find_stale_transient_shard_import_modules(paths, current_tracked_modules)
+        if stale_transient_modules:
+            preview = "\n".join(f"- {module_name}" for module_name in stale_transient_modules[:20])
+            fail(
+                "检测到无活动 session 下残留的 transient shard import。",
+                details=[
+                    "这些模块没有直接 `import TemporaryAxiomTool`，但仍然导入了自己的 shard：\n" + preview,
+                ],
+                hints=[
+                    "这通常说明上一次 prepare / cleanup 异常中断。",
+                    "先移除这些模块源码中的 `import TemporaryAxiomTool.TheoremRegistry.Shards.<Module>` 后再重试。",
+                ],
+            )
         if requested_target.module_name is not None and requested_target.module_name not in current_tracked_modules:
             fail(
                 "目标模块尚未纳入 theorem registry 跟踪。",
@@ -2284,16 +2421,22 @@ def prepare_session(args: argparse.Namespace, paths) -> None:
             )
         ensure_probe_tool_ready(paths)
         print("Scanning target closure for session-local explicit `sorry` theorems...", flush=True)
-        module_closure, untracked_session_temporary_axioms = collect_session_temporary_axioms(
+        module_closure, untracked_session_temporary_axioms, transient_shard_import_modules = collect_session_temporary_axioms(
             paths,
             target_info=target_info,
             tracked_modules=set(current_tracked_modules),
             module_closure=target_closure,
+            inserted_shard_import_modules_out=transient_shard_import_modules,
         )
         session_temporary_axioms = merge_session_temporary_axioms(
             tracked_session_temporary_axioms,
             untracked_session_temporary_axioms,
         )
+        untracked_temporary_modules = session_untracked_temporary_modules(
+            tracked_modules=current_tracked_modules,
+            session_temporary_axioms=session_temporary_axioms,
+        )
+        active_session_host_modules = merge_module_lists(current_tracked_modules, untracked_temporary_modules)
         persistent_axioms = registry_permitted_axioms(updated_registry_db)
         permitted_axioms = merge_permitted_axioms(
             target_decl_name=str(target_info["decl_name"]),
@@ -2302,30 +2445,34 @@ def prepare_session(args: argparse.Namespace, paths) -> None:
         )
         write_active_shards(
             paths,
-            tracked_modules=current_tracked_modules,
+            tracked_modules=active_session_host_modules,
             target_decl=str(target_info["decl_name"]),
             target_hash=str(target_info["statement_hash"]),
             permitted_axioms=permitted_axioms,
         )
-        print("Verifying prepared workspace by building the target module...", flush=True)
-        target_build_result = run_command(
-            paths,
-            ["lake", "build", target_module],
-            f"验证 prepared workspace 中 `{target_module}` 可以构建",
-            allow_failure=True,
-        )
-        if target_build_result.returncode != 0:
-            output = "\n".join(
-                part for part in [target_build_result.stdout.strip(), target_build_result.stderr.strip()] if part
+        eager_verify_needed = target_module not in collect_modules
+        verification_status = "skipped_collect_built"
+        if eager_verify_needed:
+            print("Verifying prepared workspace by building the target module...", flush=True)
+            target_build_result = run_command(
+                paths,
+                ["lake", "build", target_module],
+                f"验证 prepared workspace 中 `{target_module}` 可以构建",
+                allow_failure=True,
             )
-            fail(
-                "prepare 完成后，target 模块仍然无法构建。",
-                details=[
-                    f"目标模块：`{target_module}`",
-                    "输出：\n" + (output or "<空>"),
-                ],
-                hints=["先检查当前报错是否来自 target 模块自身，或是否存在与 theorem-registry 无关的编译错误。"],
-            )
+            if target_build_result.returncode != 0:
+                output = "\n".join(
+                    part for part in [target_build_result.stdout.strip(), target_build_result.stderr.strip()] if part
+                )
+                fail(
+                    "prepare 完成后，target 模块仍然无法构建。",
+                    details=[
+                        f"目标模块：`{target_module}`",
+                        "输出：\n" + (output or "<空>"),
+                    ],
+                    hints=["先检查当前报错是否来自 target 模块自身，或是否存在与 theorem-registry 无关的编译错误。"],
+                )
+            verification_status = "completed"
         base_commit = args.base_commit if args.base_commit is not None else try_git_head(paths)
         session_payload = {
             "schema_version": SESSION_SCHEMA_VERSION,
@@ -2356,7 +2503,9 @@ def prepare_session(args: argparse.Namespace, paths) -> None:
                     }
                     for entry in permitted_axioms
                 ],
+                "permitted_axioms_list": permitted_axiom_decl_names(permitted_axioms),
             },
+            "transient_shard_import_modules": transient_shard_import_modules,
         }
         write_session(paths, session_payload)
         grouped_permitted_axioms = write_prepare_reports(
@@ -2371,12 +2520,22 @@ def prepare_session(args: argparse.Namespace, paths) -> None:
             module_closure=module_closure,
             grouped_permitted_axioms=grouped_permitted_axioms,
             session_temporary_count=len(session_temporary_axioms),
+            verification_status=verification_status,
         )
     except BaseException:
+        if transient_shard_import_modules:
+            remove_transient_shard_imports(paths, transient_shard_import_modules)
         if current_tracked_modules:
             write_inactive_shards(
                 paths,
-                tracked_modules=current_tracked_modules,
+                tracked_modules=(
+                    merge_module_lists(
+                        current_tracked_modules,
+                        [module_name for module_name in active_session_host_modules if module_name not in transient_shard_import_modules],
+                    )
+                    if active_session_host_modules
+                    else current_tracked_modules
+                ),
             )
         remove_session_artifacts(paths)
         raise
@@ -2386,62 +2545,28 @@ def prepare_session(args: argparse.Namespace, paths) -> None:
 
 def cleanup_session(paths) -> None:
     session_payload = load_session(paths)
-    current_tracked_modules = discover_tracked_modules(paths)
-    inserted_shard_import_modules = ensure_stable_shard_imports(paths, current_tracked_modules)
-    registry_db = load_registry_db(paths)
-    current_hashes = collect_registry_source_hashes(paths, current_tracked_modules)
-    dirty_modules = {str(module_name) for module_name in registry_db.get("dirty_modules", [])}
-    changed_tracked_modules = [
-        module_name
-        for module_name in current_tracked_modules
-        if (
-                registry_db.get("module_digests", {}).get(module_name) != current_hashes[module_name]
-                or module_name in dirty_modules
-            )
-        ]
-    if inserted_shard_import_modules:
-        changed_tracked_modules = merge_module_lists(changed_tracked_modules, inserted_shard_import_modules)
-    if changed_tracked_modules:
-        print("Refreshing proved theorem registry for changed tracked modules...", flush=True)
-        write_collect_shards(
-            paths,
-            tracked_modules=current_tracked_modules,
-            collect_modules=changed_tracked_modules,
-        )
-        collected_entries = collect_tracked_theorems_by_build(
-            paths,
-            collect_modules=changed_tracked_modules,
-        )
-    else:
-        collected_entries = []
-    updated_registry_db = refresh_registry_for_modules_from_collect(
-        registry_db,
-        modules=changed_tracked_modules,
-        digests_by_module=current_hashes,
-        collected_entries=collected_entries,
-        tracked_modules=current_tracked_modules,
-        clear_dirty_modules=True,
+    session_temporaries = extract_session_session_temporary_axioms(session_payload)
+    tracked_modules = extract_session_tracked_modules(session_payload)
+    transient_shard_import_modules = extract_session_transient_shard_import_modules(session_payload)
+    cleanup_host_modules = session_host_modules(
+        tracked_modules=tracked_modules,
+        session_temporary_axioms=session_temporaries,
     )
-    write_registry_db(paths, updated_registry_db)
     write_inactive_shards(
         paths,
-        tracked_modules=current_tracked_modules,
+        tracked_modules=cleanup_host_modules,
+    )
+    if transient_shard_import_modules:
+        remove_transient_shard_imports(paths, transient_shard_import_modules)
+    write_inactive_shards(
+        paths,
+        tracked_modules=tracked_modules,
     )
     remove_session_artifacts(paths)
-    previous_decl_names = {
-        str(existing.get("decl_name"))
-        for existing in registry_db.get("proved_theorems", [])
-        if isinstance(existing, dict)
-    }
-    new_decl_names = {
-        str(entry["decl_name"])
-        for entry in updated_registry_db.get("proved_theorems", [])
-        if isinstance(entry, dict) and str(entry.get("decl_name")) not in previous_decl_names
-    }
     print("Cleaned up the active theorem-registry session.")
-    print(f"- tracked modules: {len(current_tracked_modules)}")
-    print(f"- newly registered proved theorems: {len(new_decl_names)}")
-    print(f"- proved registry DB: {relative_path_str(paths.project_root, paths.registry_db_file)}")
+    print(f"- tracked modules: {len(tracked_modules)}")
+    print(f"- transient shard imports removed: {len(transient_shard_import_modules)}")
+    print(f"- proved registry DB unchanged: {relative_path_str(paths.project_root, paths.registry_db_file)}")
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -2466,7 +2591,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="Automatically refresh stale or missing module artifacts before resolving the target or refreshing changed tracked modules.",
     )
 
-    subparsers.add_parser("cleanup", help="Deactivate the current session and update the persistent proved theorem registry.")
+    subparsers.add_parser("cleanup", help="Deactivate the current session and clean transient shard state.")
     return parser
 
 

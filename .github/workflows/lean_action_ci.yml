@@ -16,7 +16,7 @@ jobs:
         run: python3 -m py_compile scripts/temporary_axiom_session.py scripts/session_tool/*.py
       - name: Session Roundtrip
         run: |
-          lake build TemporaryAxiomTool TemporaryAxiomTool.TestFixture.Target TemporaryAxiomTool.TestFixture.PrivateReplay
+          lake build TemporaryAxiomTool TemporaryAxiomTool.TestFixture.Target TemporaryAxiomTool.TestFixture.PrivateReplay TemporaryAxiomTool.TestFixture.UntrackedTarget
           python3 scripts/temporary_axiom_session.py prepare \
             --target TemporaryAxiomTool.TestFixture.Target:goal \
             --auto-build
@@ -29,3 +29,13 @@ jobs:
           lake build TemporaryAxiomTool.TestFixture.PrivateReplay
           python3 scripts/temporary_axiom_session.py cleanup
           lake build TemporaryAxiomTool.TestFixture.PrivateReplay
+          python3 scripts/temporary_axiom_session.py prepare \
+            --target TemporaryAxiomTool.TestFixture.UntrackedTarget:goal \
+            --auto-build
+          lake build TemporaryAxiomTool.TestFixture.UntrackedTarget
+          rg -n "import TemporaryAxiomTool.TheoremRegistry.Shards.TemporaryAxiomTool.TestFixture.UntrackedDep" TemporaryAxiomTool/TestFixture/UntrackedDep.lean
+          python3 scripts/temporary_axiom_session.py cleanup
+          if rg -n "import TemporaryAxiomTool.TheoremRegistry.Shards.TemporaryAxiomTool.TestFixture.UntrackedDep" TemporaryAxiomTool/TestFixture/UntrackedDep.lean; then
+            exit 1
+          fi
+          lake build TemporaryAxiomTool.TestFixture.UntrackedTarget
