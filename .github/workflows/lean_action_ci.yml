@@ -33,9 +33,9 @@ jobs:
             --target TemporaryAxiomTool.TestFixture.UntrackedTarget:goal \
             --auto-build
           lake build TemporaryAxiomTool.TestFixture.UntrackedTarget
-          rg -n "import TemporaryAxiomTool.TheoremRegistry.Shards.TemporaryAxiomTool.TestFixture.UntrackedDep" TemporaryAxiomTool/TestFixture/UntrackedDep.lean
+          grep -n "import TemporaryAxiomTool.TheoremRegistry.Shards.TemporaryAxiomTool.TestFixture.UntrackedDep" TemporaryAxiomTool/TestFixture/UntrackedDep.lean
           python3 scripts/temporary_axiom_session.py cleanup
-          if rg -n "import TemporaryAxiomTool.TheoremRegistry.Shards.TemporaryAxiomTool.TestFixture.UntrackedDep" TemporaryAxiomTool/TestFixture/UntrackedDep.lean; then
+          if grep -n "import TemporaryAxiomTool.TheoremRegistry.Shards.TemporaryAxiomTool.TestFixture.UntrackedDep" TemporaryAxiomTool/TestFixture/UntrackedDep.lean; then
             exit 1
           fi
           lake build TemporaryAxiomTool.TestFixture.UntrackedTarget
