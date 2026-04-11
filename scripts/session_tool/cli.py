@@ -44,6 +44,7 @@ from .lean_ops import (
     run_lean_probe,
     try_git_head,
     write_active_shards,
+    write_collect_shards,
     write_inactive_shards,
 )
 
@@ -1294,6 +1295,46 @@ def merge_module_lists(*module_lists: list[str]) -> list[str]:
     return merged
 
 
+def collect_tracked_theorems_by_build(
+    paths,
+    *,
+    collect_modules: list[str],
+) -> list[dict[str, object]]:
+    if not collect_modules:
+        return []
+    collect_module_set = {str(module_name) for module_name in collect_modules}
+    collected_by_key: dict[tuple[str, str], dict[str, object]] = {}
+    for module_name in dependency_first_module_order(paths, collect_modules):
+        result = run_command(
+            paths,
+            ["lake", "build", module_name],
+            f"collect 模式构建 `{module_name}` 并收集 theorem-side hash",
+            allow_failure=True,
+        )
+        if result.returncode != 0:
+            output = "\n".join(part for part in [result.stdout.strip(), result.stderr.strip()] if part)
+            fail(
+                "collect 模式构建失败。",
+                details=[
+                    f"模块：`{module_name}`",
+                    "输出：\n" + (output or "<空>"),
+                ],
+            )
+        payloads = parse_json_payload_lines(result.stdout, result.stderr)
+        for payload in payloads:
+            if str(payload.get("kind", "")) != COLLECT_PAYLOAD_KIND:
+                continue
+            payload_module = str(payload.get("module", ""))
+            if payload_module not in collect_module_set:
+                continue
+            normalized = normalize_collected_decl(paths, payload)
+            collected_by_key[(str(normalized["module"]), str(normalized["decl_name"]))] = normalized
+    return sorted(
+        collected_by_key.values(),
+        key=lambda item: (str(item["module"]), int(item["ordinal"]), str(item["decl_name"])),
+    )
+
+
 def collect_module_theorems_by_local_replay(
     paths,
     *,
@@ -1369,9 +1410,8 @@ def collect_tracked_theorems_by_local_replay(
     *,
     replay_modules: list[str],
 ) -> list[dict[str, object]]:
-    ordered_modules = dependency_first_module_order(paths, replay_modules)
     collected_entries: list[dict[str, object]] = []
-    for module_name in ordered_modules:
+    for module_name in replay_modules:
         collected_entries.extend(
             collect_module_theorems_by_local_replay(
                 paths,
@@ -2123,6 +2163,7 @@ def print_prepare_summary(
     module_closure: list[str],
     grouped_permitted_axioms: dict[str, list[dict[str, str]]],
     session_temporary_count: int,
+    verification_status: str,
 ) -> None:
     permitted_count = sum(len(entries) for entries in grouped_permitted_axioms.values())
     print(f"Prepared session for `{target_info['decl_name']}`.")
@@ -2146,7 +2187,10 @@ def print_prepare_summary(
                     print(f"    - {entry['decl_name']} [{entry['origin']}]")
     else:
         print("- permitted axiom list is long; see the saved report for the full grouped list.")
-    print("- verification: completed via a final target-module build")
+    if verification_status == "completed":
+        print("- verification: completed via a final target-module build")
+    else:
+        print("- verification: skipped because the target module already passed collect build")
     print(f"- session data: {relative_path_str(paths.project_root, paths.session_file)}")
     print(f"- report: {relative_path_str(paths.project_root, paths.report_file)}")
     print(f"- proved registry DB: {relative_path_str(paths.project_root, paths.registry_db_file)}")
@@ -2282,10 +2326,15 @@ def prepare_session(args: argparse.Namespace, paths) -> None:
             ),
         )
         if collect_modules:
-            print("Locally replaying changed tracked modules for theorem-side hashes...", flush=True)
-            collected_entries = collect_tracked_theorems_by_local_replay(
+            print("Collecting theorem-side hashes for changed tracked modules...", flush=True)
+            write_collect_shards(
                 paths,
-                replay_modules=collect_modules,
+                tracked_modules=current_tracked_modules,
+                collect_modules=collect_modules,
+            )
+            collected_entries = collect_tracked_theorems_by_build(
+                paths,
+                collect_modules=collect_modules,
             )
         else:
             collected_entries = []
@@ -2401,25 +2450,29 @@ def prepare_session(args: argparse.Namespace, paths) -> None:
             target_hash=str(target_info["statement_hash"]),
             permitted_axioms=permitted_axioms,
         )
-        print("Verifying prepared workspace by building the target module...", flush=True)
-        target_build_result = run_command(
-            paths,
-            ["lake", "build", target_module],
-            f"验证 prepared workspace 中 `{target_module}` 可以构建",
-            allow_failure=True,
-        )
-        if target_build_result.returncode != 0:
-            output = "\n".join(
-                part for part in [target_build_result.stdout.strip(), target_build_result.stderr.strip()] if part
+        eager_verify_needed = target_module not in collect_modules
+        verification_status = "skipped_collect_built"
+        if eager_verify_needed:
+            print("Verifying prepared workspace by building the target module...", flush=True)
+            target_build_result = run_command(
+                paths,
+                ["lake", "build", target_module],
+                f"验证 prepared workspace 中 `{target_module}` 可以构建",
+                allow_failure=True,
             )
-            fail(
-                "prepare 完成后，target 模块仍然无法构建。",
-                details=[
-                    f"目标模块：`{target_module}`",
-                    "输出：\n" + (output or "<空>"),
-                ],
-                hints=["先检查当前报错是否来自 target 模块自身，或是否存在与 theorem-registry 无关的编译错误。"],
-            )
+            if target_build_result.returncode != 0:
+                output = "\n".join(
+                    part for part in [target_build_result.stdout.strip(), target_build_result.stderr.strip()] if part
+                )
+                fail(
+                    "prepare 完成后，target 模块仍然无法构建。",
+                    details=[
+                        f"目标模块：`{target_module}`",
+                        "输出：\n" + (output or "<空>"),
+                    ],
+                    hints=["先检查当前报错是否来自 target 模块自身，或是否存在与 theorem-registry 无关的编译错误。"],
+                )
+            verification_status = "completed"
         base_commit = args.base_commit if args.base_commit is not None else try_git_head(paths)
         session_payload = {
             "schema_version": SESSION_SCHEMA_VERSION,
@@ -2467,6 +2520,7 @@ def prepare_session(args: argparse.Namespace, paths) -> None:
             module_closure=module_closure,
             grouped_permitted_axioms=grouped_permitted_axioms,
             session_temporary_count=len(session_temporary_axioms),
+            verification_status=verification_status,
         )
     except BaseException:
         if transient_shard_import_modules:

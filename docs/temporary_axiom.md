@@ -15,16 +15,16 @@
 
 - 都使用 theorem-side statement hash。
 - 都在活动 session 中把 permitted theorem 改写成同名 axiom。
-- 都会在 prepare 末尾用真实 `lake build <target-module>` 检查 prepared workspace。
+- 都保留“必要时才执行”的最终真实 `lake build <target-module>` verify。
 
 `wild-skip` 相对 `main` 的主要实现差异是 `prepare` 的 steady-state 优化：
 
 - `main`
   每次 `prepare` 都会把 `changed tracked ∪ target closure 内的 tracked modules` 一起切到 collect 模式并真实 `lake build`。
 - `wild-skip`
-  tracked modules 的 theorem 信息统一改为依赖序的 module-local collect replay，不再逐模块 `lake build`。
+  只有当 `target closure` 里存在已变化的 tracked module 时，才退回上述完整 collect 路径。
 - `wild-skip`
-  若 `target closure` 内的 tracked modules 都未变化，则只 replay 真正变更的 tracked modules；target closure 内其余相关 tracked modules 只额外 replay 当前 target module 和命中显式 `sorry` 的 tracked modules。
+  若 `target closure` 内的 tracked modules 都未变化，则只对真正变更的 tracked modules 做 collect build；target closure 内其余相关 tracked modules 改用本地 collect replay，只为当前 target 重新拿 theorem-side hash 与 `sorry` 信息。
 
 因此，这个分支优化的是“第二次及后续 prepare”的成本，而不是放松校验。
 
@@ -148,7 +148,7 @@ python3 scripts/temporary_axiom_session.py prepare --target MyProj.Mod:goal --au
 
 ### 6.2 目标解析与构建前提
 
-- 若使用 `<module>:<decl>`，`prepare` 不再要求 tracked modules 先有最新 `.ilean` / `.trace`；这些模块会直接进入本地 collect replay。
+- 若使用 `<module>:<decl>`，`prepare` 不再要求 tracked modules 先有最新 `.ilean` / `.trace`；这些模块会直接进入 collect build。
 - 若使用 `<fully-qualified-decl>`，仍需要依赖已有产物来解析候选模块中的目标声明；此时若候选模块产物缺失或过期，默认报错，显式给 `--auto-build` 才会自动补构建。
 - 对 target closure 里未 tracked 的普通模块，session-temporary 收集改为“源码扫描找候选 + 临时插入 shard import + 本地 collect replay”，不再依赖 import-probe 取 theorem-side hash。
 - 若检测到“没有直接 `import TemporaryAxiomTool` 的普通模块，却残留了自己的 shard import”，`prepare` 会在这里直接报错。这通常说明上一次 prepare / cleanup 中断，避免后面跑很久才发现环境本来就是脏的。
@@ -160,7 +160,7 @@ python3 scripts/temporary_axiom_session.py prepare --target MyProj.Mod:goal --au
 - 发生变化或被强制刷新的 tracked modules
 - target closure 内的 tracked modules
 
-随后按依赖顺序对这些模块做 module-local collect replay。collect 阶段对每个 theorem / lemma 一次性得到：
+随后把这些模块切到 collect 模式并逐模块真实 `lake build`。collect 阶段对每个 theorem / lemma 一次性得到：
 
 - `decl_name`
 - `statement_hash`
@@ -241,13 +241,18 @@ import TemporaryAxiomTool.TheoremRegistry.Shards.<Module>
 
 ### 6.8 verify
 
-`prepare` 的最终 verify 是固定的一次真实 build：
+`prepare` 的最终 verify 现在是条件触发：
 
 ```bash
 lake build <target-module>
 ```
 
-这一步的目的，是确认“写完 active shards 后的真实 workspace”可以直接编译；因为前面的 tracked-module 信息收集只是 local replay，不等价于真实 `lake build`。
+触发条件：
+
+- 若 target module 没有在本轮 collect build 中真实构建过，则会执行这次 eager active verify。
+- 若 target module 已在本轮 collect build 中真实构建过，则跳过这次 eager verify。
+
+跳过的理由是：这时 target module 已经在 prepare 内真实过了一次 collect build，脚本只是在 collect 结果基础上把已知 theorem-side hash 写回 active runtime，不再需要立刻再跑一轮等价的 eager verify。
 
 ## 7. `cleanup`
 
@@ -378,7 +383,7 @@ proved DB 结构：
 - 不解析 `.olean` 二进制格式。
 - `.ilean` 只用于 declaration range 和 import 信息。
 - 源码扫描只负责便宜地判定“theorem / lemma 是否显式 `sorry`”。
-- tracked modules 的 theorem-side hash 通过依赖序 module-local collect replay 收集；未 tracked 的 session-temporary 候选走“临时 shard import + 本地 collect replay”。
+- tracked modules 的 theorem-side hash 通过 collect build 一次性收集；未 tracked 的 session-temporary 候选走“临时 shard import + 本地 collect replay”。
 - 无活动 session 时，不进行 theorem -> axiom 改写。
 
 ## 12. 最小回归测试

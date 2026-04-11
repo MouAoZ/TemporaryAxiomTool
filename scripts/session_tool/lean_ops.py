@@ -582,6 +582,25 @@ def write_inactive_shards(
     )
 
 
+def write_collect_shards(
+    paths,
+    *,
+    tracked_modules: list[str],
+    collect_modules: list[str],
+) -> None:
+    collect_module_set = {str(module_name) for module_name in collect_modules}
+    write_generated_shards(
+        paths,
+        tracked_modules=tracked_modules,
+        mode_by_module={
+            module_name: ("collect" if module_name in collect_module_set else "inactive")
+            for module_name in tracked_modules
+        },
+        target_decl=None,
+        target_hash=None,
+        permitted_axioms=[],
+    )
+
 def write_active_shards(
     paths,
     *,
