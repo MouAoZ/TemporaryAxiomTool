@@ -1,6 +1,6 @@
 # TemporaryAxiomTool 使用手册
 
-这份文档描述当前工具的用户可见行为：如何接入、如何运行 `prepare` / `cleanup`、会生成哪些文件、外层工具应读取哪些信息，以及常见错误该如何处理。
+这份文档描述工具的用户可见行为：如何接入、如何运行 `prepare` / `cleanup`、会生成哪些文件、外层工具应读取哪些信息，以及常见错误该如何处理。
 
 ## 1. 工具做什么
 
@@ -17,7 +17,7 @@
 4. `other`
    既不是 target，也不在 permitted 集合中的 theorem / lemma。保持普通 Lean 行为。
 
-当前版本统一使用 theorem-side statement hash。也就是说，校验基于 Lean elaboration 后的声明头，而不是源码文本。
+工具统一使用 theorem-side statement hash。也就是说，校验基于 Lean elaboration 后的声明头，而不是源码文本。
 
 ## 2. 接入项目
 
@@ -122,6 +122,8 @@ python3 scripts/temporary_axiom_session.py prepare --target MyProj.Mod:goal --au
 8. 若 target module 本轮还没有在 collect 阶段被真实构建过，再额外做一次 `lake build <target-module>` 验证 prepared workspace。
 9. 写出 session 文件和报告。
 
+若第 1 步发现仓库里已经有活动 session，`prepare` 会直接退出，现有 session 文件和报告保持不变。
+
 执行成功后，终端会打印：
 
 - target module
@@ -179,7 +181,7 @@ permitted theorem 包括：
 
 ### 4.4 `@[temporary_axiom]`
 
-显式 `@[temporary_axiom]` 仍然可用，但现在是可选的显式校验入口。
+显式 `@[temporary_axiom]` 仍然可用，它是一个可选的显式校验入口。
 
 用户只需要记住两点：
 
@@ -192,7 +194,7 @@ permitted theorem 包括：
 
 这是外层工具应读取的主文件。
 
-当前结构：
+结构示例：
 
 ```json
 {
@@ -269,7 +271,7 @@ permitted theorem 包括：
 
 这是本地持久 proved theorem 数据库。
 
-当前结构：
+结构示例：
 
 ```json
 {
@@ -385,6 +387,8 @@ import TemporaryAxiomTool
 
 - 继续当前会话
 - 或先执行 `cleanup`
+
+这类报错不会清除已有 session；`session.json` 和报告会保留，直到用户显式运行 `cleanup`。
 
 ### 7.5 `另一个 prepare 正在运行`
 

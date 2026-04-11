@@ -2219,8 +2219,10 @@ def prepare_session(args: argparse.Namespace, paths) -> None:
     current_tracked_modules: list[str] = []
     transient_shard_import_modules: list[str] = []
     active_session_host_modules: list[str] = []
+    can_remove_session_artifacts = False
     try:
         assert_no_active_session(paths)
+        can_remove_session_artifacts = True
         requested_target = parse_target_spec(args.target)
         current_tracked_modules = discover_tracked_modules(paths)
         stale_transient_modules = find_stale_transient_shard_import_modules(paths, current_tracked_modules)
@@ -2537,7 +2539,8 @@ def prepare_session(args: argparse.Namespace, paths) -> None:
                     else current_tracked_modules
                 ),
             )
-        remove_session_artifacts(paths)
+        if can_remove_session_artifacts:
+            remove_session_artifacts(paths)
         raise
     finally:
         release_prepare_lock(paths)

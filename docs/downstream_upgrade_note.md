@@ -34,6 +34,8 @@ import TemporaryAxiomTool.TheoremRegistry.Shards.<CurrentModule>
 3. 外部 verifier / comparator 读取 `.temporary_axiom_session/session.json`
 4. `cleanup`
 
+如果调度器误触了第二次 `prepare`，工具会直接报“已有活动 session”并保留现场；结束当前会话仍应由调度器显式调用 `cleanup`。
+
 推荐读取的字段：
 
 - `freeze.target`
@@ -47,7 +49,7 @@ import TemporaryAxiomTool.TheoremRegistry.Shards.<CurrentModule>
 
 ## 3. 迁移时应更新的假设
 
-迁移到当前版本后，下游应采用这些新假设：
+迁移到当前架构后，下游应采用这些假设：
 
 - 跟踪范围由“是否直接 `import TemporaryAxiomTool`”决定
 - tracked modules 会保留稳定 shard import
@@ -65,7 +67,7 @@ import TemporaryAxiomTool.TheoremRegistry.Shards.<CurrentModule>
 - `cleanup.edits`
 - 任何“cleanup 会回滚 managed attr / managed import”的逻辑
 
-当前版本不再要求下游依赖这套旧运行时对象。
+下游只需要依赖当前这套运行时对象和会话文件。
 
 ## 5. 升级后建议检查的文件
 

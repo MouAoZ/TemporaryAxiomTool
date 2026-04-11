@@ -58,6 +58,8 @@ python3 scripts/temporary_axiom_session.py prepare \
 python3 scripts/temporary_axiom_session.py cleanup
 ```
 
+若仓库里已经有活动 session，`prepare` 会直接退出并保留现场；是否结束当前会话由用户显式决定。
+
 ## 你会看到的文件
 
 - `.temporary_axiom_session/session.json`
