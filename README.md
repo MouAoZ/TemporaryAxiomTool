@@ -11,6 +11,19 @@
 - `docs/downstream_upgrade_note.md`
   从旧版 `PreparedSession` / managed-attr 工作流迁移到当前架构时需要注意的变化。
 
+## `wild-skip` 相对 `main`
+
+当前分支文档描述的是 `wild-skip`，不是 `main`。
+
+相对 `main`，这个分支的主要区别只有一处流程优化：
+
+- `main`
+  `prepare` 会对 `changed tracked ∪ target closure 内的 tracked modules` 一起做 collect build。
+- `wild-skip`
+  若 `target closure` 里的 tracked modules 都没变，则只对真正变了的 tracked modules 做 collect build；对未变化但与当前 target 相关的 tracked modules，改为本地 collect replay 取 theorem-side hash。
+- 两者共同点
+  都保留 theorem-side hash 语义，也都保留最后一次真实 `lake build <target-module>` verify。`wild-skip` 改的是 steady-state prepare 的成本，不改安全边界。
+
 ## 快速使用
 
 先构建工具：
@@ -33,7 +46,7 @@ python3 scripts/temporary_axiom_session.py prepare \
   --target YourProject.Section.goal
 ```
 
-如果模块产物缺失，或 `.ilean` / `.trace` 已经过期，`prepare` 会尽早报错。确需让工具补构建时，可显式给：
+若用 `<module>:<decl>` 形式，`prepare` 会直接通过 collect build 收集 tracked modules 的 theorem-side hash。只有在按完整声明名解析 target、或需要补齐某些普通模块产物时，才会用到 `--auto-build`：
 
 ```bash
 python3 scripts/temporary_axiom_session.py prepare \
@@ -41,13 +54,7 @@ python3 scripts/temporary_axiom_session.py prepare \
   --auto-build
 ```
 
-`prepare` 默认会在最后真实重建一次 target module，确认 prepared workspace 可直接编译。若只想先生成 session，再把这轮验证留给后续 `lake build`，可显式给：
-
-```bash
-python3 scripts/temporary_axiom_session.py prepare \
-  --target YourProject.Section:goal \
-  --no-verify
-```
+`prepare` 默认会在最后真实 `lake build <target-module>` 一次，用当前 active shards 验证准备后的 workspace 可直接编译。
 
 结束后清理当前 session：
 
@@ -97,13 +104,12 @@ freeze = session["freeze"]
 `prepare` 的主流程是：
 
 1. 解析 target，要求目标模块已经纳入 tracked modules。
-2. 预检 target 相关模块和发生变化的 tracked modules，确认 `.ilean` / `.olean` / `.trace` 与当前源码一致；必要时可配合 `--auto-build`。
-3. 对发生变化或被标记 dirty 的 tracked modules 做“全量维护”：
-   先丢弃这些模块旧的 proved entries，再重新扫描并登记当前已证明 theorem / lemma。
-4. 扫描 target closure，收集本次 session-local 的显式 `sorry` theorem / lemma。
-5. 生成 `TemporaryAxiomTool/TheoremRegistry/Shards/**/*.lean`。
-6. 必要时给 tracked modules 插入稳定 shard import。
-7. 默认重建一次 target module 作为 verify；`--no-verify` 可跳过。
+2. 必要时给 tracked modules 插入稳定 shard import。
+3. 找出发生变化的 tracked modules，并取 `changed tracked ∪ target closure 内的 tracked modules`。
+4. 把这些模块切到 collect 模式，逐模块真实 `lake build`，一次拿到 theorem-side hash、显式 `sorry` 标记和源码顺序信息。
+5. 用 collect 结果刷新持久 proved DB：只登记非 `sorry` 的 theorem / lemma。
+6. 从 collect 结果中提取 tracked 部分的 session-local temporary theorems；对 target closure 里未 tracked 的模块，再补一次源码扫描/Lean probe。
+7. 写入 active shards，并真实 `lake build <target-module>` 一次确认当前 prepared workspace 可直接编译。
 8. 写出 `session.json` 与明文报告。
 
 `prepare` 里的冻结信息统一使用 Lean elaboration 后的 theorem-side statement hash，而不是源码文本 hash。
@@ -112,7 +118,7 @@ freeze = session["freeze"]
 
 `cleanup` 不再回滚源码 import，也不再删除 shard 文件。它只做三件事：
 
-1. 对本次发生变化的 tracked modules 做增量扫描，把新证明成功的 theorem / lemma 加进 proved DB。
+1. 对本次发生变化或被显式要求刷新的 tracked modules 再做一次 collect build，刷新 proved DB。
 2. 把所有 shard 重写为“无活动 session”的 inactive 状态。
 3. 删除 `.temporary_axiom_session/session.json` 和 `temporary_axiom_tool_session_report.txt`。
 
@@ -126,7 +132,7 @@ freeze = session["freeze"]
 `.temporary_axiom_session/session.json` 只保留稳定的 `freeze` 数据，供外层工具读取。核心字段：
 
 - `target`
-  `decl_name` 是 Lean 真实全限定声明名；`module` 是定义模块名；`statement_hash` 是 theorem-side hash。
+  `decl_name` 是 Lean 环境里的真实声明名；它可能带 namespace，也可能就是裸短名。`module` 是定义模块名；`statement_hash` 是 theorem-side hash。
 - `tracked_modules`
   当前被 theorem registry 跟踪的项目模块列表。
 - `module_closure`

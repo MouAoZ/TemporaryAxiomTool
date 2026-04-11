@@ -7,6 +7,27 @@
 - 快速使用见 [../README.md](../README.md)
 - 迁移说明见 [downstream_upgrade_note.md](./downstream_upgrade_note.md)
 
+## `wild-skip` 相对 `main`
+
+这份文档描述的是当前 `wild-skip` 分支，不是 `main`。
+
+两者的核心语义保持一致：
+
+- 都使用 theorem-side statement hash。
+- 都在活动 session 中把 permitted theorem 改写成同名 axiom。
+- 都保留最后一次真实 `lake build <target-module>` 作为最终 verify。
+
+`wild-skip` 相对 `main` 的主要实现差异是 `prepare` 的 steady-state 优化：
+
+- `main`
+  每次 `prepare` 都会把 `changed tracked ∪ target closure 内的 tracked modules` 一起切到 collect 模式并真实 `lake build`。
+- `wild-skip`
+  只有当 `target closure` 里存在已变化的 tracked module 时，才退回上述完整 collect 路径。
+- `wild-skip`
+  若 `target closure` 内的 tracked modules 都未变化，则只对真正变更的 tracked modules 做 collect build；target closure 内其余相关 tracked modules 改用本地 collect replay，只为当前 target 重新拿 theorem-side hash 与 `sorry` 信息。
+
+因此，这个分支优化的是“第二次及后续 prepare”的成本，而不是放松校验。
+
 ## 1. 文件结构
 
 ```text
@@ -105,7 +126,6 @@ python3 scripts/temporary_axiom_session.py prepare --target MyProj.Mod:goal
 python3 scripts/temporary_axiom_session.py prepare --target MyProj.Mod:My.Namespace.goal
 python3 scripts/temporary_axiom_session.py prepare --target MyProj.Mod.goal
 python3 scripts/temporary_axiom_session.py prepare --target MyProj.Mod:goal --auto-build
-python3 scripts/temporary_axiom_session.py prepare --target MyProj.Mod:goal --no-verify
 ```
 
 参数：
@@ -113,9 +133,7 @@ python3 scripts/temporary_axiom_session.py prepare --target MyProj.Mod:goal --no
 - `--target`
   支持 `<module>:<decl>` 或 `<fully-qualified-decl>`。
 - `--auto-build`
-  允许在预检阶段自动 `lake build` 缺失或过期的模块闭包。
-- `--no-verify`
-  跳过最后一次真实 `lake build <target-module>`。
+  允许在目标解析或普通模块 probe 需要时，自动 `lake build` 缺失或过期的模块闭包。
 
 ### 6.1 target 解析
 
@@ -128,40 +146,40 @@ python3 scripts/temporary_axiom_session.py prepare --target MyProj.Mod:goal --no
 - `<fully-qualified-decl>`
   只按声明名前缀尝试有限个候选模块；若声明名和模块路径不对齐，应改用前一种形式。
 
-### 6.2 预检
+### 6.2 目标解析与构建前提
 
-`prepare` 会先检查相关模块的：
+- 若使用 `<module>:<decl>`，`prepare` 不再要求 tracked modules 先有最新 `.ilean` / `.trace`；这些模块会直接进入 collect build。
+- 若使用 `<fully-qualified-decl>`，仍需要依赖已有产物来解析候选模块中的目标声明；此时若候选模块产物缺失或过期，默认报错，显式给 `--auto-build` 才会自动补构建。
+- 对 target closure 里未 tracked 的普通模块，后续 session-temporary 扫描若走 import-probe，也仍要求它们能被正常导入；通常这会在 collect/build target module 的过程中自然补齐。
 
-- `.ilean`
-- `.olean`
-- `.trace`
-- `.ilean` 记录的 direct imports 是否仍和当前源码一致
-- `.trace` 里的源码文本 hash 是否仍和当前源码一致
+### 6.3 collect 与 persistent proved registry 对齐
 
-若目标模块或需要维护的 tracked modules 不满足这些条件，则：
+`prepare` 会读取 `.temporary_axiom_registry/proved_theorems.json`，并取：
 
-- 默认直接报错。
-- 只有显式给 `--auto-build` 时才会自动补构建。
+- 发生变化或被强制刷新的 tracked modules
+- target closure 内的 tracked modules
 
-### 6.3 proved DB 的全量维护
+随后把这些模块切到 collect 模式并逐模块真实 `lake build`。collect 阶段对每个 theorem / lemma 一次性得到：
 
-`prepare` 会读取 `.temporary_axiom_registry/proved_theorems.json`，并对“发生变化或被标记 dirty 的 tracked modules”做全量维护：
+- `decl_name`
+- `statement_hash`
+- `explicit_sorry`
+- `ordinal`
 
-1. 丢弃这些模块旧的 proved entries。
-2. 重新扫描这些模块里所有“已证明的 theorem / lemma”。
-3. 重新 probe 它们的 theorem-side statement hash。
-4. 用新结果回写 proved DB。
+其中：
 
-这里的“已证明”只指源码里没有显式 `sorry` 的 theorem / lemma；显式 `sorry` 的声明不会进入持久 proved DB。
+- 非 `sorry` 的 theorem / lemma 会写入或刷新持久 proved DB。
+- 显式 `sorry` 的 theorem / lemma 不会进入持久 proved DB。
+- target module 的 `ordinal` 只用于决定哪些显式 `sorry` 能进入本次 session-temporary 集合。
 
 ### 6.4 session-local temporary axioms
 
 在 proved DB 刷新完后，`prepare` 会针对 target 收集 session-local temporary axioms：
 
-- 只扫描 target 的项目内依赖闭包。
-- 只看 tracked modules。
+- 对 target closure 内的 tracked modules，直接复用 collect 结果。
+- 对 target closure 内未 tracked 的模块，再做源码扫描；必要时补 Lean probe。
 - 依赖模块里：收集显式 `sorry` 的 theorem / lemma。
-- target 所在模块里：只收集排在 target 之前的显式 `sorry` theorem / lemma。
+- target 所在模块里：只排除 target 自身以及排在 target 之后的显式 `sorry` theorem / lemma；排在 target 之后但已经证明完成的 theorem 仍可作为 persistent proved 生效。
 
 ### 6.5 permitted 集合
 
@@ -194,7 +212,13 @@ python3 scripts/temporary_axiom_session.py prepare --target MyProj.Mod:goal --no
 
 注册使用 `#register_temporary_axiom_module_shard ...` 自定义命令，一次性把该模块的数据放进 `SimplePersistentEnvExtension`。
 
-当前实现不是“每个 theorem 一条 marker declaration”，而是“每个模块一张表”。
+shard 有三种模式：
+
+- `inactive`
+- `collect`
+- `active`
+
+当前实现不是“每个 theorem 一条 marker declaration”，而是“每个模块一张表 + 一个模式位”。
 
 ### 6.7 稳定 import
 
@@ -208,15 +232,13 @@ import TemporaryAxiomTool.TheoremRegistry.Shards.<Module>
 
 ### 6.8 verify
 
-默认情况下，`prepare` 最后会执行：
+`prepare` 当前只做一次最终 verify：
 
 ```bash
 lake build <target-module>
 ```
 
-目的不是回填 hash，而是确认“写完 active shards 后的真实 workspace”可以直接编译。
-
-`--no-verify` 只会跳过这一步；不会影响前面的 hash 冻结逻辑。
+这个 verify 的目的只是确认“写完 active shards 后的真实 workspace”可以直接编译。当前架构不再依赖运行时 mismatch 回填 hash。
 
 ## 7. `cleanup`
 
@@ -229,14 +251,14 @@ python3 scripts/temporary_axiom_session.py cleanup
 `cleanup` 的行为：
 
 1. 读取活动 session。
-2. 找出自上次 registry digest 以来发生变化的 tracked modules。
-3. 对这些模块做增量扫描，把新证明成功的 theorem / lemma 加进 proved DB。
-4. 把这些变化模块标记为 `dirty_modules`，确保下一次 `prepare` 会对它们做一次全量维护。
-5. 把所有 shard 重写为 inactive 状态：
-   - `target = anonymous`
-   - `target_hash = 0`
-   - `permitted = persistent proved entries by module`
-6. 删除：
+2. 找出自上次 registry digest 以来发生变化、或被显式标记需要刷新的 tracked modules。
+3. 对这些模块再做一次 collect build，并用 collect 结果刷新 proved DB：
+   - 新出现且非 `sorry` 的 theorem / lemma 会被登记
+   - 已消失或已变成 `sorry` 的条目会被移除
+4. 把所有 shard 重写为 inactive 状态：
+   - `mode = inactive`
+   - 不携带 target / permitted 数据
+5. 删除：
    - `.temporary_axiom_session/session.json`
    - `temporary_axiom_tool_session_report.txt`
 
@@ -285,7 +307,7 @@ python3 scripts/temporary_axiom_session.py cleanup
 注意：
 
 - 当前版本已经没有 `cleanup.edits`。
-- `target.decl_name` 永远是 Lean 真实全限定声明名。
+- `target.decl_name` 是 Lean 环境里的真实声明名；它可能带 namespace，也可能就是裸短名。
 - `target.module` 永远是定义模块名。
 
 ## 9. `proved_theorems.json`
@@ -294,9 +316,9 @@ proved DB 结构：
 
 ```json
 {
-  "schema_version": 1,
+  "schema_version": 2,
   "tracked_modules": ["MyProj.Mod", "MyProj.Dep"],
-  "dirty_modules": ["MyProj.Mod"],
+  "dirty_modules": [],
   "module_digests": {
     "MyProj.Mod": "deadbeef..."
   },
@@ -316,7 +338,7 @@ proved DB 结构：
 - `tracked_modules`
   上次维护时看到的 tracked module 列表。
 - `dirty_modules`
-  cleanup 曾增量登记过、但下一次 prepare 仍需做全量维护的模块。
+  兼容字段。当前实现把它当作“下一次 prepare / cleanup 必须强制 collect 刷新”的模块集合；成功刷新后通常为空。
 - `module_digests`
   用于判断 tracked module 源码是否变化。
 - `proved_theorems`
@@ -339,8 +361,8 @@ proved DB 结构：
 
 - 不解析 `.olean` 二进制格式。
 - `.ilean` 只用于 declaration range 和 import 信息。
-- 源码扫描只负责判定“theorem / lemma 是否显式 `sorry`”以及“是否已证明”。
-- 真正的 statement hash 只通过 Lean elaboration 获取。
+- 源码扫描只负责便宜地判定“theorem / lemma 是否显式 `sorry`”。
+- tracked modules 的 theorem-side hash 通过 collect build 一次性收集；未 tracked 的 session-temporary 候选才会走单独的 Lean probe。
 - 无活动 session 时，不进行 theorem -> axiom 改写。
 
 ## 12. 最小回归测试
@@ -350,11 +372,17 @@ python3 -m py_compile \
   scripts/temporary_axiom_session.py \
   scripts/session_tool/*.py
 
-lake build TemporaryAxiomTool
+lake build TemporaryAxiomTool TemporaryAxiomTool.TestFixture.PrivateReplay
 
 python3 scripts/temporary_axiom_session.py prepare \
   --target TemporaryAxiomTool.TestFixture.Target:goal
 lake build TemporaryAxiomTool.TestFixture.Target
 python3 scripts/temporary_axiom_session.py cleanup
 lake build TemporaryAxiomTool.TestFixture.Target
+
+python3 scripts/temporary_axiom_session.py prepare \
+  --target TemporaryAxiomTool.TestFixture.PrivateReplay:goal
+lake build TemporaryAxiomTool.TestFixture.PrivateReplay
+python3 scripts/temporary_axiom_session.py cleanup
+lake build TemporaryAxiomTool.TestFixture.PrivateReplay
 ```

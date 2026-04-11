@@ -6,4 +6,4 @@ This file is managed by TemporaryAxiomTool.
 -/
 import TemporaryAxiomTool.TheoremRegistry
 
-#register_temporary_axiom_module_shard "TemporaryAxiomTool.TestFixture.Misaligned" "inactive" "" "0" ""
+#register_temporary_axiom_module_shard "TemporaryAxiomTool.TestFixture.PrivateReplay" "inactive" "" "0" ""

@@ -253,11 +253,13 @@ def ensure_probe_tool_ready(paths) -> None:
         f"{TOOL_NAMESPACE}.StatementHash",
         TOOL_THEOREM_REGISTRY_TYPES_MODULE,
         TOOL_THEOREM_REGISTRY_MODULE,
+        f"{TOOL_NAMESPACE}.TemporaryAxiom",
     ]
     required_sources = [
         paths.project_root / TOOL_NAMESPACE / "StatementHash.lean",
         paths.project_root / TOOL_NAMESPACE / "TheoremRegistry" / "Types.lean",
         paths.project_root / TOOL_NAMESPACE / "TheoremRegistry.lean",
+        paths.project_root / TOOL_NAMESPACE / "TemporaryAxiom.lean",
     ]
     for module_name in required_modules:
         olean_path = module_artifact_path(paths, module_name, ".olean")
@@ -289,6 +291,7 @@ def run_lean_source(
     source: str,
     description: str,
     allow_failure: bool = False,
+    extra_args: list[str] | None = None,
 ) -> tuple[subprocess.CompletedProcess[str], list[dict[str, object]]]:
     with tempfile.NamedTemporaryFile(
         "w",
@@ -304,7 +307,7 @@ def run_lean_source(
     try:
         result = run_command(
             paths,
-            [*lean_cmd, str(temp_path)],
+            [*lean_cmd, *(extra_args or []), str(temp_path)],
             description,
             allow_failure=allow_failure,
             env=lean_env,
@@ -315,8 +318,113 @@ def run_lean_source(
     for line in result.stdout.splitlines():
         stripped = line.strip()
         if stripped.startswith("{") and stripped.endswith("}"):
-            payloads.append(json.loads(stripped))
+            try:
+                payload = json.loads(stripped)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(payload, dict):
+                payloads.append(payload)
     return result, payloads
+
+
+def run_lean_module_source(
+    paths,
+    *,
+    module_name: str,
+    source: str,
+    description: str,
+    allow_failure: bool = False,
+    extra_args: list[str] | None = None,
+    extra_sources: dict[str, str] | None = None,
+) -> tuple[subprocess.CompletedProcess[str], list[dict[str, object]]]:
+    with tempfile.TemporaryDirectory(
+        prefix="TemporaryAxiomToolReplay_",
+        dir=paths.project_root,
+    ) as temp_root_name:
+        temp_root = Path(temp_root_name)
+        temp_path = temp_root / module_name_to_relative_path(module_name)
+        temp_path.parent.mkdir(parents=True, exist_ok=True)
+        temp_path.write_text(source, encoding="utf-8")
+        for extra_module_name, extra_source in (extra_sources or {}).items():
+            extra_path = temp_root / module_name_to_relative_path(extra_module_name)
+            extra_path.parent.mkdir(parents=True, exist_ok=True)
+            extra_path.write_text(extra_source, encoding="utf-8")
+        lean_cmd, lean_env = lean_command_configuration(paths)
+        effective_env = None if lean_env is None else dict(lean_env)
+        if extra_sources:
+            if effective_env is None:
+                effective_env = dict(os.environ)
+            existing_lean_path = effective_env.get("LEAN_PATH", "")
+            effective_env["LEAN_PATH"] = (
+                f"{temp_root}:{existing_lean_path}" if existing_lean_path else str(temp_root)
+            )
+        result = run_command(
+            paths,
+            [*lean_cmd, *(extra_args or []), f"--root={temp_root}", str(temp_path)],
+            description,
+            allow_failure=allow_failure,
+            env=effective_env,
+        )
+    payloads: list[dict[str, object]] = []
+    for line in result.stdout.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("{") and stripped.endswith("}"):
+            try:
+                payload = json.loads(stripped)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(payload, dict):
+                payloads.append(payload)
+    return result, payloads
+
+
+def run_lean_module_file(
+    paths,
+    *,
+    module_path: Path,
+    description: str,
+    allow_failure: bool = False,
+    extra_args: list[str] | None = None,
+) -> tuple[subprocess.CompletedProcess[str], list[dict[str, object]]]:
+    lean_cmd, lean_env = lean_command_configuration(paths)
+    result = run_command(
+        paths,
+        [*lean_cmd, *(extra_args or []), str(module_path)],
+        description,
+        allow_failure=allow_failure,
+        env=lean_env,
+    )
+    payloads: list[dict[str, object]] = []
+    for line in result.stdout.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("{") and stripped.endswith("}"):
+            try:
+                payload = json.loads(stripped)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(payload, dict):
+                payloads.append(payload)
+    return result, payloads
+
+
+def compile_importable_lean_module(
+    paths,
+    *,
+    source_path: Path,
+    module_name: str,
+    description: str,
+) -> tuple[Path, Path]:
+    lean_cmd, lean_env = lean_command_configuration(paths)
+    olean_path = module_artifact_path(paths, module_name, ".olean")
+    ilean_path = module_artifact_path(paths, module_name, ".ilean")
+    olean_path.parent.mkdir(parents=True, exist_ok=True)
+    run_command(
+        paths,
+        [*lean_cmd, str(source_path), "-o", str(olean_path), "-i", str(ilean_path)],
+        description,
+        env=lean_env,
+    )
+    return olean_path, ilean_path
 
 
 def run_lean_probe(
@@ -340,11 +448,6 @@ def run_lean_probe(
         allow_failure=allow_failure,
     )
 
-
-def lean_name_literal(name: str) -> str:
-    return f"`{name}"
-
-
 def lean_string_literal(text: str) -> str:
     escaped = (
         text.replace("\\", "\\\\")
@@ -360,7 +463,7 @@ def try_probe_decl_in_module(paths, module_name: str, decl_name: str) -> dict[st
     result, payloads = run_lean_probe(
         paths,
         imports=[module_name],
-        command_lines=[f"#print_temporary_axiom_decl_probe {lean_name_literal(decl_name)}"],
+        command_lines=[f"#print_temporary_axiom_decl_probe_text {lean_string_literal(decl_name)}"],
         description=f"探测声明 `{decl_name}`",
         allow_failure=True,
     )
@@ -380,6 +483,7 @@ def generated_shard_runtime_path(paths, module_name: str) -> Path:
 def generated_shard_module_source(
     *,
     module_name: str,
+    mode: str,
     target_decl: str | None,
     target_hash: str | None,
     permitted_axioms: list[dict[str, object]],
@@ -388,7 +492,6 @@ def generated_shard_module_source(
         f"{entry['decl_name']}\t{entry['statement_hash']}"
         for entry in sorted(permitted_axioms, key=lambda item: str(item["decl_name"]))
     )
-    generated_module = generated_shard_runtime_module_name(module_name)
     return (
         "module\n\n"
         "/-\n"
@@ -398,6 +501,7 @@ def generated_shard_module_source(
         f"import {TOOL_THEOREM_REGISTRY_MODULE}\n\n"
         f"#register_temporary_axiom_module_shard "
         f"{lean_string_literal(module_name)} "
+        f"{lean_string_literal(mode)} "
         f"{lean_string_literal(target_decl or '')} "
         f"{lean_string_literal(target_hash or '0')} "
         f"{lean_string_literal(permitted_payload)}\n"
@@ -408,6 +512,7 @@ def generated_shard_sources(
     paths,
     *,
     tracked_modules: list[str],
+    mode_by_module: dict[str, str],
     target_decl: str | None,
     target_hash: str | None,
     permitted_axioms: list[dict[str, object]],
@@ -418,9 +523,10 @@ def generated_shard_sources(
     return {
         generated_shard_runtime_path(paths, module_name): generated_shard_module_source(
             module_name=module_name,
-            target_decl=target_decl,
-            target_hash=target_hash,
-            permitted_axioms=grouped.get(module_name, []),
+            mode=mode_by_module.get(module_name, "inactive"),
+            target_decl=target_decl if mode_by_module.get(module_name, "inactive") == "active" else None,
+            target_hash=target_hash if mode_by_module.get(module_name, "inactive") == "active" else None,
+            permitted_axioms=grouped.get(module_name, []) if mode_by_module.get(module_name, "inactive") == "active" else [],
         )
         for module_name in tracked_modules
     }
@@ -430,6 +536,7 @@ def write_generated_shards(
     paths,
     *,
     tracked_modules: list[str],
+    mode_by_module: dict[str, str],
     target_decl: str | None,
     target_hash: str | None,
     permitted_axioms: list[dict[str, object]],
@@ -438,12 +545,15 @@ def write_generated_shards(
     sources = generated_shard_sources(
         paths,
         tracked_modules=tracked_modules,
+        mode_by_module=mode_by_module,
         target_decl=target_decl,
         target_hash=target_hash,
         permitted_axioms=permitted_axioms,
     )
     for path, source in sources.items():
         path.parent.mkdir(parents=True, exist_ok=True)
+        if path.exists() and path.read_text(encoding="utf-8") == source:
+            continue
         path.write_text(source, encoding="utf-8")
     expected_paths = set(sources)
     for path in sorted(paths.generated_shards_root.rglob("*.lean")):
@@ -461,12 +571,50 @@ def write_inactive_shards(
     paths,
     *,
     tracked_modules: list[str],
-    persistent_axioms: list[dict[str, object]],
 ) -> None:
     write_generated_shards(
         paths,
         tracked_modules=tracked_modules,
+        mode_by_module={module_name: "inactive" for module_name in tracked_modules},
         target_decl=None,
         target_hash=None,
-        permitted_axioms=persistent_axioms,
+        permitted_axioms=[],
+    )
+
+
+def write_collect_shards(
+    paths,
+    *,
+    tracked_modules: list[str],
+    collect_modules: list[str],
+) -> None:
+    collect_module_set = {str(module_name) for module_name in collect_modules}
+    write_generated_shards(
+        paths,
+        tracked_modules=tracked_modules,
+        mode_by_module={
+            module_name: ("collect" if module_name in collect_module_set else "inactive")
+            for module_name in tracked_modules
+        },
+        target_decl=None,
+        target_hash=None,
+        permitted_axioms=[],
+    )
+
+
+def write_active_shards(
+    paths,
+    *,
+    tracked_modules: list[str],
+    target_decl: str,
+    target_hash: str,
+    permitted_axioms: list[dict[str, object]],
+) -> None:
+    write_generated_shards(
+        paths,
+        tracked_modules=tracked_modules,
+        mode_by_module={module_name: "active" for module_name in tracked_modules},
+        target_decl=target_decl,
+        target_hash=target_hash,
+        permitted_axioms=permitted_axioms,
     )

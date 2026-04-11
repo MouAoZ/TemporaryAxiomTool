@@ -22,6 +22,47 @@ private meta def userVisibleDeclName (declName : Name) : Name :=
   | some userName => userName
   | none => declName.eraseMacroScopes
 
+public meta initialize collectOrdinalRef : IO.Ref Nat ←
+  IO.mkRef 0
+
+private meta def nextCollectOrdinal : CommandElabM Nat := do
+  liftIO do
+    let ordinal ← collectOrdinalRef.get
+    collectOrdinalRef.set (ordinal + 1)
+    return ordinal
+
+private meta partial def syntaxContainsExplicitSorry (stx : Syntax) : Bool :=
+  stx.getKind == ``Parser.Term.sorry ||
+    stx.getKind == ``Parser.Tactic.tacticSorry ||
+    stx.getArgs.any syntaxContainsExplicitSorry
+
+private meta def theoremDeclHasExplicitSorry (decl : Syntax) : Bool :=
+  let declVal := decl[3]!
+  syntaxContainsExplicitSorry declVal
+
+private meta def collectedTheoremJson
+    (moduleName : Name)
+    (declName : Name)
+    (statementHash : UInt64)
+    (explicitSorry : Bool)
+    (ordinal : Nat) : Json :=
+  Json.mkObj [
+    ("kind", Json.str "temporary_axiom_collect"),
+    ("module", Json.str <| toString moduleName),
+    ("decl_name", Json.str <| toString declName),
+    ("statement_hash", Json.str <| toString statementHash.toNat),
+    ("explicit_sorry", Json.bool explicitSorry),
+    ("ordinal", Json.str <| toString ordinal)
+  ]
+
+private meta def logCollectedTheoremHash
+    (moduleName : Name)
+    (declName : Name)
+    (statementHash : UInt64)
+    (explicitSorry : Bool)
+    (ordinal : Nat) : CommandElabM Unit := do
+  liftIO <| IO.println (collectedTheoremJson moduleName declName statementHash explicitSorry ordinal).compress
+
 private meta def ensureTemporaryAxiomNoArgs (stx : Syntax) : AttrM Unit := do
   if stx.getKind == ``Parser.Attr.temporary_axiom then
     pure ()
@@ -161,6 +202,8 @@ private meta def elaborateTheoremHeaderHash
           return TemporaryAxiomTool.statementHash levelParams type
 
 private meta def validateTemporaryAxiomAttrTarget (declName : Name) : AttrM Unit := do
+  if (← currentModuleMode) == .collect then
+    return
   let runtimeDeclName := userVisibleDeclName declName
   let frozenTargetName ← targetName
   if frozenTargetName == Name.anonymous then
@@ -192,9 +235,21 @@ public meta def elabTrackedTheoremDeclaration : CommandElab := fun stx => do
   let decl := stx[1]
   if decl.getKind != ``Parser.Command.theorem then
     throwUnsupportedSyntax
-  if !(← liftCoreM hasActiveSession) then
-    throwUnsupportedSyntax
   let resolved ← resolveTheoremDecl stx
+  let moduleMode ← liftCoreM currentModuleMode
+  if moduleMode == .inactive then
+    throwUnsupportedSyntax
+  if moduleMode == .collect then
+    let actualHash ← elaborateTheoremHeaderHash resolved
+    let explicitSorry := theoremDeclHasExplicitSorry resolved.decl
+    let ordinal ← nextCollectOrdinal
+    let moduleName ← liftCoreM do
+      return (← getEnv).mainModule
+    logCollectedTheoremHash moduleName resolved.userDeclName actualHash explicitSorry ordinal
+    let axiomStx ← liftMacroM <|
+      buildAxiomizedDeclaration ⟨stx[0]⟩ resolved.declId resolved.declSig
+    Command.elabDeclaration axiomStx
+    return
   let explicitTemporaryAxiom := hasTemporaryAxiomAttr stx[0]
   let frozenTargetName ← liftCoreM targetName
   let permittedEntry? ← liftCoreM <| permittedTheoremFor? resolved.userDeclName

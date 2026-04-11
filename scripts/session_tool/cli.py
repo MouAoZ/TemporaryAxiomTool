@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import re
 from collections import defaultdict, deque
@@ -13,6 +14,9 @@ from typing import Any
 from .common import (
     IMPORT_RE,
     TOOL_ROOT_MODULE,
+    TOOL_TEMPORARY_AXIOM_MODULE,
+    TOOL_THEOREM_REGISTRY_MODULE,
+    TOOL_THEOREM_REGISTRY_SHARDS_MODULE_PREFIX,
     acquire_prepare_lock,
     ensure_layout,
     fail,
@@ -27,15 +31,20 @@ from .common import (
 )
 from .lean_ops import (
     build_module,
+    compile_importable_lean_module,
     compute_text_file_hashes,
     ensure_probe_tool_ready,
+    generated_shard_module_source,
     generated_shard_runtime_module_name,
+    lean_string_literal,
     module_artifact_path,
     run_command,
+    run_lean_module_file,
+    run_lean_module_source,
     run_lean_probe,
     try_git_head,
-    try_probe_decl_in_module,
-    write_generated_shards,
+    write_active_shards,
+    write_collect_shards,
     write_inactive_shards,
 )
 
@@ -55,9 +64,10 @@ DECL_MODIFIER_TOKENS = {
     "local",
     "scoped",
 }
-REGISTRY_SCHEMA_VERSION = 1
+REGISTRY_SCHEMA_VERSION = 2
 SESSION_SCHEMA_VERSION = 4
 MAX_PROBE_WORKERS = 4
+COLLECT_PAYLOAD_KIND = "temporary_axiom_collect"
 
 
 @dataclass(frozen=True)
@@ -129,7 +139,7 @@ def candidate_target_modules_from_decl_name(paths, decl_name: str) -> list[str]:
     candidates: list[str] = []
     for end in range(len(parts) - 1, 0, -1):
         module_name = ".".join(parts[:end])
-        if is_host_project_module(paths.project_root, module_name) and module_name not in candidates:
+        if is_session_host_module(paths, module_name) and module_name not in candidates:
             candidates.append(module_name)
     return candidates
 
@@ -142,6 +152,46 @@ def range_key(payload: dict[str, object]) -> tuple[int, int]:
 
 def short_decl_name(decl_name: str) -> str:
     return decl_name.rsplit(".", 1)[-1]
+
+
+def is_internal_tool_support_module(module_name: str) -> bool:
+    return (
+        module_name == TOOL_ROOT_MODULE
+        or module_name == TOOL_TEMPORARY_AXIOM_MODULE
+        or module_name == TOOL_THEOREM_REGISTRY_MODULE
+        or module_name.startswith(TOOL_THEOREM_REGISTRY_MODULE + ".")
+        or module_name.startswith(TOOL_THEOREM_REGISTRY_SHARDS_MODULE_PREFIX + ".")
+        or module_name == f"{TOOL_ROOT_MODULE}.StatementHash"
+    )
+
+
+def is_session_host_module(paths, module_name: str) -> bool:
+    return is_host_project_module(paths.project_root, module_name) and not is_internal_tool_support_module(module_name)
+
+
+def user_visible_decl_name(module_name: str, decl_name: str) -> str:
+    if not decl_name.startswith("_private."):
+        return decl_name
+    parts = decl_name.split(".")
+    module_parts = module_name.split(".")
+    prefix = ["_private", *module_parts]
+    if len(parts) <= len(prefix) + 1:
+        return decl_name
+    if parts[: len(prefix)] != prefix:
+        return decl_name
+    if not parts[len(prefix)].isdigit():
+        return decl_name
+    suffix = parts[len(prefix) + 1 :]
+    if not suffix:
+        return decl_name
+    return ".".join(suffix)
+
+
+def entry_probe_decl_name(entry: dict[str, object]) -> str:
+    implementation_name = entry.get("implementation_name")
+    if implementation_name:
+        return str(implementation_name)
+    return str(entry["decl_name"])
 
 
 def normalize_probed_decl(
@@ -158,6 +208,46 @@ def normalize_probed_decl(
         "file": relative_file,
         "statement_hash": str(payload["statement_hash"]),
         "range": range_info,
+    }
+
+
+def parse_json_payload_lines(*texts: str) -> list[dict[str, object]]:
+    payloads: list[dict[str, object]] = []
+    for text in texts:
+        for line in text.splitlines():
+            stripped = line.strip()
+            start = stripped.find("{")
+            end = stripped.rfind("}")
+            if start == -1 or end == -1 or end < start:
+                continue
+            candidate = stripped[start : end + 1]
+            try:
+                payload = read_json_payload_line(candidate)
+            except ValueError:
+                continue
+            payloads.append(payload)
+    return payloads
+
+
+def read_json_payload_line(line: str) -> dict[str, object]:
+    try:
+        payload = json.loads(line)
+    except Exception as exc:  # pragma: no cover - helper only filters malformed log lines
+        raise ValueError from exc
+    if not isinstance(payload, dict):
+        raise ValueError
+    return payload
+
+
+def normalize_collected_decl(paths, payload: dict[str, object]) -> dict[str, object]:
+    module_name = str(payload["module"])
+    return {
+        "decl_name": str(payload["decl_name"]),
+        "module": module_name,
+        "file": relative_path_str(paths.project_root, module_name_to_path(paths.project_root, module_name)),
+        "statement_hash": str(payload["statement_hash"]),
+        "explicit_sorry": bool(payload.get("explicit_sorry", False)),
+        "ordinal": int(str(payload.get("ordinal", "0"))),
     }
 
 
@@ -352,6 +442,7 @@ def clear_module_metadata_caches() -> None:
     module_source_text.cache_clear()
     module_line_starts.cache_clear()
     sanitized_module_source_text.cache_clear()
+    module_header_insertion_offset.cache_clear()
     direct_imports_from_source.cache_clear()
 
 
@@ -370,7 +461,8 @@ def module_decl_entries_from_ilean(paths, module_name: str) -> list[dict[str, ob
             continue
         entries.append(
             {
-                "decl_name": decl_name,
+                "decl_name": user_visible_decl_name(module_name, decl_name),
+                "implementation_name": decl_name,
                 "module": module_name,
                 "file": relative_file,
                 "range": normalize_range(raw),
@@ -385,7 +477,7 @@ def direct_host_imports_from_metadata(paths, metadata: dict[str, Any]) -> list[s
         if not isinstance(item, list) or not item:
             continue
         imported = str(item[0])
-        if is_host_project_module(paths.project_root, imported) and imported not in imports:
+        if is_session_host_module(paths, imported) and imported not in imports:
             imports.append(imported)
     return imports
 
@@ -426,7 +518,7 @@ def direct_host_imports_from_source(paths, module_name: str) -> tuple[str, ...]:
     return tuple(
         imported
         for imported in direct_imports_from_source(paths, module_name)
-        if is_host_project_module(paths.project_root, imported)
+        if is_session_host_module(paths, imported)
     )
 
 
@@ -725,6 +817,234 @@ def try_decl_range_from_ilean(paths, module_name: str, decl_name: str) -> dict[s
     return normalize_range(raw)
 
 
+def dedupe_decl_entries_by_visible_name(entries: list[dict[str, object]]) -> list[dict[str, object]]:
+    deduped: list[dict[str, object]] = []
+    seen: set[str] = set()
+    for entry in entries:
+        decl_name = str(entry["decl_name"])
+        if decl_name in seen:
+            continue
+        seen.add(decl_name)
+        deduped.append(entry)
+    return deduped
+
+
+@lru_cache(maxsize=None)
+def module_header_insertion_offset(paths, module_name: str) -> int:
+    text = module_source_text(paths, module_name)
+    offset = 0
+    in_block_comment = False
+    for line in text.splitlines(keepends=True):
+        stripped = line.strip()
+        if in_block_comment:
+            offset += len(line)
+            if "-/" in stripped:
+                in_block_comment = False
+            continue
+        if not stripped:
+            offset += len(line)
+            continue
+        if stripped.startswith("/-"):
+            offset += len(line)
+            if "-/" not in stripped:
+                in_block_comment = True
+            continue
+        if stripped.startswith("--"):
+            offset += len(line)
+            continue
+        if stripped in {"module", "prelude"}:
+            offset += len(line)
+            continue
+        if IMPORT_RE.match(line):
+            offset += len(line)
+            continue
+        return offset
+    return len(text)
+
+
+def module_entries_require_local_replay(module_entries: list[dict[str, object]]) -> bool:
+    return False
+
+
+def entry_identity_key(entry: dict[str, object]) -> tuple[str, tuple[int, int]]:
+    return (str(entry["decl_name"]), range_key(entry))
+
+
+def select_hashed_entries(
+    hashed_entries: list[dict[str, object]],
+    selected_entries: list[dict[str, object]],
+) -> list[dict[str, object]]:
+    wanted_keys = {entry_identity_key(entry) for entry in selected_entries}
+    return [entry for entry in hashed_entries if entry_identity_key(entry) in wanted_keys]
+
+
+def collect_decl_entries_via_import_probe(
+    paths,
+    *,
+    module_name: str,
+    module_entries: list[dict[str, object]],
+    description_prefix: str,
+) -> list[dict[str, object]]:
+    result, payloads = run_lean_probe(
+        paths,
+        imports=[module_name],
+        command_lines=[
+            f"#print_temporary_axiom_decl_probe_text {lean_string_literal(entry_probe_decl_name(entry))}"
+            for entry in module_entries
+        ],
+        description=f"{description_prefix} `{module_name}`",
+        allow_failure=True,
+    )
+    if result.returncode != 0:
+        output = "\n".join(part for part in [result.stdout.strip(), result.stderr.strip()] if part)
+        if "object file '" in output and " does not exist" in output:
+            return collect_decl_entries_via_replay(
+                paths,
+                module_name=module_name,
+                module_entries=module_entries,
+                description_prefix="缺少可导入产物，退回到模块内 replay 探测 theorem-side statement hash in",
+            )
+        fail(
+            "Lean probe 执行失败。",
+            details=[
+                f"模块：`{module_name}`",
+                "输出：\n" + (output or "<空>"),
+            ],
+        )
+    payload_by_name = {str(payload["requested_name"]): payload for payload in payloads}
+    missing = [
+        entry_probe_decl_name(entry)
+        for entry in module_entries
+        if entry_probe_decl_name(entry) not in payload_by_name
+    ]
+    if missing:
+        preview = missing[:10]
+        details = [
+            f"模块：`{module_name}`",
+            f"缺失数量：{len(missing)}",
+            "缺失声明：\n" + "\n".join(f"- {decl_name}" for decl_name in preview),
+        ]
+        output = "\n".join(part for part in [result.stdout.strip(), result.stderr.strip()] if part)
+        if output:
+            details.append("probe 输出：\n" + output)
+        if len(missing) > len(preview):
+            details.append(f"其余缺失条目：{len(missing) - len(preview)} 个")
+        fail("Lean probe 没有返回全部候选声明。", details=details)
+    return [
+        normalize_probed_decl(
+            payload_by_name[entry_probe_decl_name(entry)],
+            module_name=str(entry["module"]),
+            relative_file=str(entry["file"]),
+            range_info=entry["range"],
+        )
+        for entry in module_entries
+    ]
+
+
+def build_collect_replay_source(
+    paths,
+    *,
+    module_name: str,
+    module_entries: list[dict[str, object]],
+) -> str:
+    return module_source_text(paths, module_name)
+
+
+def build_collect_replay_payload(module_entries: list[dict[str, object]]) -> str:
+    candidate_names: list[str] = []
+    seen: set[str] = set()
+    for entry in module_entries:
+        decl_name = str(entry["decl_name"])
+        if decl_name in seen:
+            continue
+        seen.add(decl_name)
+        candidate_names.append(decl_name)
+    return "\n".join(candidate_names)
+
+
+def collect_decl_entries_via_replay(
+    paths,
+    *,
+    module_name: str,
+    module_entries: list[dict[str, object]],
+    description_prefix: str,
+) -> list[dict[str, object]]:
+    replay_root = paths.session_root / "replay_candidates"
+    replay_root.mkdir(parents=True, exist_ok=True)
+    payload_path = replay_root / f"{module_name}.txt"
+    payload_path.write_text(build_collect_replay_payload(module_entries), encoding="utf-8")
+    try:
+        result, payloads = run_lean_module_source(
+            paths,
+            module_name=module_name,
+            source=build_collect_replay_source(
+                paths,
+                module_name=module_name,
+                module_entries=module_entries,
+            ),
+            description=f"{description_prefix} `{module_name}`",
+            allow_failure=True,
+        )
+    finally:
+        payload_path.unlink(missing_ok=True)
+    if result.returncode != 0:
+        output = "\n".join(part for part in [result.stdout.strip(), result.stderr.strip()] if part)
+        fail(
+            "模块内 theorem replay 失败。",
+            details=[
+                f"模块：`{module_name}`",
+                "输出：\n" + (output or "<空>"),
+            ],
+        )
+    payload_by_name = {
+        str(payload["decl_name"]): payload
+        for payload in payloads
+        if isinstance(payload, dict) and "decl_name" in payload and "statement_hash" in payload
+    }
+    missing = [
+        str(entry["decl_name"])
+        for entry in module_entries
+        if str(entry["decl_name"]) not in payload_by_name
+    ]
+    if missing:
+        preview = missing[:10]
+        details = [
+            f"模块：`{module_name}`",
+            f"缺失数量：{len(missing)}",
+            "缺失声明：\n" + "\n".join(f"- {decl_name}" for decl_name in preview),
+        ]
+        output = "\n".join(part for part in [result.stdout.strip(), result.stderr.strip()] if part)
+        if output:
+            details.append("replay 输出：\n" + output)
+        if len(missing) > len(preview):
+            details.append(f"其余缺失条目：{len(missing) - len(preview)} 个")
+        fail("模块内 theorem replay 没有返回全部候选声明。", details=details)
+    return [
+        normalize_probed_decl(
+            payload_by_name[str(entry["decl_name"])],
+            module_name=str(entry["module"]),
+            relative_file=str(entry["file"]),
+            range_info=entry["range"],
+        )
+        for entry in module_entries
+    ]
+
+
+def scan_all_theorem_like_entries(
+    paths,
+    module_name: str,
+    *,
+    before_entry: dict[str, object] | None = None,
+) -> list[dict[str, object]]:
+    return scan_theorem_like_entries(
+        paths,
+        module_name,
+        before_entry=before_entry,
+        include_proved=True,
+        include_sorry=True,
+    )
+
+
 def probe_target_decl(
     paths,
     *,
@@ -732,13 +1052,44 @@ def probe_target_decl(
     module_name: str,
     range_info: dict[str, int],
 ) -> dict[str, object]:
-    payload = try_probe_decl_in_module(paths, module_name, decl_name)
-    if payload is None:
+    matching_entries = [
+        entry
+        for entry in module_decl_entries_from_ilean(paths, module_name)
+        if str(entry["decl_name"]) == decl_name and dict(entry["range"]) == range_info
+    ]
+    if not matching_entries:
         fail(
-            "无法对目标声明执行 Lean probe。",
+            "无法从 `.ilean` 中定位目标声明。",
             details=[f"目标声明：`{decl_name}`", f"目标模块：`{module_name}`"],
-            hints=["确认该声明在模块中可见，并且模块可以单独构建。"],
         )
+    target_entry = matching_entries[0]
+    context_entries = [
+        entry
+        for entry in scan_all_theorem_like_entries(paths, module_name)
+        if range_key(entry) <= range_key(target_entry)
+    ]
+    if module_entries_require_local_replay(context_entries):
+        probed_entries = select_hashed_entries(
+            collect_decl_entries_via_replay(
+                paths,
+                module_name=module_name,
+                module_entries=context_entries,
+                description_prefix="重放目标声明所在模块的 theorem-like 上下文 in",
+            ),
+            [target_entry],
+        )
+    else:
+        probed_entries = probe_decl_entries(
+            paths,
+            candidates=[target_entry],
+            description_prefix="探测目标声明的 theorem-side statement hash in",
+        )
+    if len(probed_entries) != 1:
+        fail(
+            "目标声明的 theorem-side hash 探测结果数量异常。",
+            details=[f"目标声明：`{decl_name}`", f"目标模块：`{module_name}`", f"返回数量：`{len(probed_entries)}`"],
+        )
+    payload = probed_entries[0]
     resolved_module = str(payload["module"])
     if resolved_module != module_name:
         fail(
@@ -766,45 +1117,61 @@ def resolve_decl_reference_in_module(
     decl_name: str,
     decl_is_short_name: bool,
 ) -> tuple[str, dict[str, int]]:
+    short_name = short_decl_name(decl_name)
     if not decl_is_short_name:
         range_info = try_decl_range_from_ilean(paths, module_name, decl_name)
-        if range_info is None:
-            fail(
-                "指定模块的 `.ilean` 中找不到目标声明。",
-                details=[f"目标声明：`{decl_name}`", f"目标模块：`{module_name}`"],
-                hints=[
-                    "这里的模块部分必须是声明的定义模块，而不只是 re-export 它的模块。",
-                    "如果你只有完整声明名，也可以直接使用 `--target <fully-qualified-decl>`。",
-                ],
-            )
-        return decl_name, range_info
-    matches = [
+        if range_info is not None:
+            return decl_name, range_info
+    raw_candidates = [
         entry
         for entry in module_decl_entries_from_ilean(paths, module_name)
-        if short_decl_name(str(entry["decl_name"])) == decl_name
+        if short_decl_name(str(entry["decl_name"])) == short_name
     ]
+    if not raw_candidates:
+        fail(
+            "指定模块中找不到目标声明。",
+            details=[f"目标声明：`{decl_name}`", f"目标模块：`{module_name}`"],
+            hints=[
+                "这里的模块部分必须是声明的定义模块，而不只是 re-export 它的模块。",
+                "如果该声明名在 Lean 里带额外 namespace，可以改用 `--target <module>:<fully-qualified-decl>`。",
+            ],
+        )
+    visible_candidates = dedupe_decl_entries_by_visible_name(
+        probe_decl_entries(
+            paths,
+            candidates=raw_candidates,
+            description_prefix="解析目标声明的公开名 in",
+        )
+    )
+    if decl_is_short_name:
+        matches = [entry for entry in visible_candidates if short_decl_name(str(entry["decl_name"])) == decl_name]
+    else:
+        matches = [entry for entry in visible_candidates if str(entry["decl_name"]) == decl_name]
     if not matches:
         fail(
-            "指定模块中找不到该短名对应的目标声明。",
-            details=[f"目标短名：`{decl_name}`", f"目标模块：`{module_name}`"],
-            hints=["如果该声明名在 Lean 里带额外 namespace，可以改用 `--target <module>:<fully-qualified-decl>`。"],
+            "指定模块中找不到目标声明。",
+            details=[f"目标声明：`{decl_name}`", f"目标模块：`{module_name}`"],
+            hints=[
+                "这里的模块部分必须是声明的定义模块，而不只是 re-export 它的模块。",
+                "如果你只有完整声明名，也可以直接使用 `--target <fully-qualified-decl>`。",
+            ],
         )
     if len(matches) > 1:
         candidates = "\n".join(f"- {entry['decl_name']}" for entry in matches[:10])
         details = [
-            f"目标短名：`{decl_name}`",
+            f"目标声明：`{decl_name}`",
             f"目标模块：`{module_name}`",
             "匹配到多个声明：\n" + candidates,
         ]
         if len(matches) > 10:
             details.append(f"其余候选：{len(matches) - 10} 个")
         fail(
-            "指定模块中的目标短名不唯一。",
+            "指定模块中的目标声明不唯一。",
             details=details,
             hints=["请改用 `--target <module>:<fully-qualified-decl>` 明确指定目标声明。"],
         )
     match = matches[0]
-    return str(match["decl_name"]), match["range"]
+    return str(match["decl_name"]), dict(match["range"])
 
 
 def resolve_target_decl(
@@ -844,14 +1211,29 @@ def resolve_target_decl(
             hints=["如果该声明名与模块路径不对齐，请改用 `--target <module>:<decl>`。"],
         )
     for candidate_module in candidate_modules:
-        range_info = try_decl_range_from_ilean(paths, candidate_module, decl_name)
-        if range_info is None:
+        raw_candidates = [
+            entry
+            for entry in module_decl_entries_from_ilean(paths, candidate_module)
+            if short_decl_name(str(entry["decl_name"])) == short_decl_name(decl_name)
+        ]
+        if not raw_candidates:
             continue
+        visible_candidates = dedupe_decl_entries_by_visible_name(
+            probe_decl_entries(
+                paths,
+                candidates=raw_candidates,
+                description_prefix="解析候选目标声明的公开名 in",
+            )
+        )
+        matches = [entry for entry in visible_candidates if str(entry["decl_name"]) == decl_name]
+        if len(matches) != 1:
+            continue
+        match = matches[0]
         return probe_target_decl(
             paths,
             decl_name=decl_name,
             module_name=candidate_module,
-            range_info=range_info,
+            range_info=dict(match["range"]),
         )
     fail(
         "Lean 无法解析目标声明。",
@@ -867,18 +1249,30 @@ def resolve_target_decl(
 
 
 def compute_module_closure(paths, root_module: str) -> list[str]:
-    queue: deque[str] = deque([root_module])
-    seen: set[str] = set()
+    closure, _ = source_host_module_closure(paths, root_module)
+    return closure
+
+
+def dependency_first_module_order(paths, modules: list[str]) -> list[str]:
+    modules_set = set(modules)
     ordered: list[str] = []
-    while queue:
-        module_name = queue.popleft()
-        if module_name in seen:
-            continue
-        seen.add(module_name)
+    visiting: set[str] = set()
+    visited: set[str] = set()
+
+    def visit(module_name: str) -> None:
+        if module_name in visited or module_name not in modules_set:
+            return
+        if module_name in visiting:
+            return
+        visiting.add(module_name)
+        for imported in direct_host_imports_from_source(paths, module_name):
+            visit(imported)
+        visiting.remove(module_name)
+        visited.add(module_name)
         ordered.append(module_name)
-        metadata = load_ilean_metadata(paths, module_name)
-        for imported in direct_host_imports_from_metadata(paths, metadata):
-            queue.append(imported)
+
+    for module_name in modules:
+        visit(module_name)
     return ordered
 
 
@@ -887,6 +1281,182 @@ def group_entries_by_module(entries: list[dict[str, object]]) -> dict[str, list[
     for entry in entries:
         grouped[str(entry["module"])].append(entry)
     return {module_name: grouped[module_name] for module_name in sorted(grouped)}
+
+
+def merge_module_lists(*module_lists: list[str]) -> list[str]:
+    merged: list[str] = []
+    seen: set[str] = set()
+    for module_list in module_lists:
+        for module_name in module_list:
+            if module_name in seen:
+                continue
+            seen.add(module_name)
+            merged.append(module_name)
+    return merged
+
+
+def collect_tracked_theorems_by_build(
+    paths,
+    *,
+    collect_modules: list[str],
+) -> list[dict[str, object]]:
+    if not collect_modules:
+        return []
+    collect_module_set = {str(module_name) for module_name in collect_modules}
+    collected_by_key: dict[tuple[str, str], dict[str, object]] = {}
+    for module_name in dependency_first_module_order(paths, collect_modules):
+        result = run_command(
+            paths,
+            ["lake", "build", module_name],
+            f"collect 模式构建 `{module_name}` 并收集 theorem-side hash",
+            allow_failure=True,
+        )
+        if result.returncode != 0:
+            output = "\n".join(part for part in [result.stdout.strip(), result.stderr.strip()] if part)
+            fail(
+                "collect 模式构建失败。",
+                details=[
+                    f"模块：`{module_name}`",
+                    "输出：\n" + (output or "<空>"),
+                ],
+            )
+        payloads = parse_json_payload_lines(result.stdout, result.stderr)
+        for payload in payloads:
+            if str(payload.get("kind", "")) != COLLECT_PAYLOAD_KIND:
+                continue
+            payload_module = str(payload.get("module", ""))
+            if payload_module not in collect_module_set:
+                continue
+            normalized = normalize_collected_decl(paths, payload)
+            collected_by_key[(str(normalized["module"]), str(normalized["decl_name"]))] = normalized
+    return sorted(
+        collected_by_key.values(),
+        key=lambda item: (str(item["module"]), int(item["ordinal"]), str(item["decl_name"])),
+    )
+
+
+def collect_module_theorems_by_local_replay(
+    paths,
+    *,
+    module_name: str,
+) -> list[dict[str, object]]:
+    shard_source = generated_shard_module_source(
+        module_name=module_name,
+        mode="collect",
+        target_decl=None,
+        target_hash=None,
+        permitted_axioms=[],
+    )
+    shard_module_name = generated_shard_runtime_module_name(module_name)
+    shard_path = paths.project_root / module_name_to_relative_path(generated_shard_runtime_module_name(module_name))
+    shard_artifact_base = paths.lean_build_lib_root / module_name_to_relative_path(shard_module_name).with_suffix("")
+    original_shard_source = shard_path.read_text(encoding="utf-8") if shard_path.exists() else None
+    hidden_artifacts: list[tuple[Path, Path]] = []
+    ensure_layout(paths)
+    try:
+        if original_shard_source != shard_source:
+            shard_path.parent.mkdir(parents=True, exist_ok=True)
+            shard_path.write_text(shard_source, encoding="utf-8")
+        for artifact_path in sorted(shard_artifact_base.parent.glob(shard_artifact_base.name + ".*")):
+            hidden_path = artifact_path.with_name(artifact_path.name + ".temporary_axiom_replay_backup")
+            artifact_path.rename(hidden_path)
+            hidden_artifacts.append((artifact_path, hidden_path))
+        compile_importable_lean_module(
+            paths,
+            source_path=shard_path,
+            module_name=shard_module_name,
+            description=f"编译 collect shard `{shard_module_name}`",
+        )
+        result, _ = run_lean_module_file(
+            paths,
+            module_path=module_name_to_path(paths.project_root, module_name),
+            description=f"重放 `{module_name}` 并收集 theorem-side hash",
+            allow_failure=True,
+        )
+    finally:
+        for artifact_path, hidden_path in reversed(hidden_artifacts):
+            if hidden_path.exists():
+                hidden_path.rename(artifact_path)
+        if original_shard_source is None:
+            shard_path.unlink(missing_ok=True)
+        elif shard_path.read_text(encoding="utf-8") != original_shard_source:
+            shard_path.write_text(original_shard_source, encoding="utf-8")
+    if result.returncode != 0:
+        output = "\n".join(part for part in [result.stdout.strip(), result.stderr.strip()] if part)
+        fail(
+            "tracked 模块的本地 collect replay 失败。",
+            details=[
+                f"模块：`{module_name}`",
+                "输出：\n" + (output or "<空>"),
+            ],
+        )
+    collected_by_key: dict[tuple[str, str], dict[str, object]] = {}
+    for payload in parse_json_payload_lines(result.stdout, result.stderr):
+        if str(payload.get("kind", "")) != COLLECT_PAYLOAD_KIND:
+            continue
+        payload_module = str(payload.get("module", ""))
+        if payload_module != module_name:
+            continue
+        normalized = normalize_collected_decl(paths, payload)
+        collected_by_key[(str(normalized["module"]), str(normalized["decl_name"]))] = normalized
+    return sorted(
+        collected_by_key.values(),
+        key=lambda item: (str(item["module"]), int(item["ordinal"]), str(item["decl_name"])),
+    )
+
+
+def collect_tracked_theorems_by_local_replay(
+    paths,
+    *,
+    replay_modules: list[str],
+) -> list[dict[str, object]]:
+    collected_entries: list[dict[str, object]] = []
+    for module_name in replay_modules:
+        collected_entries.extend(
+            collect_module_theorems_by_local_replay(
+                paths,
+                module_name=module_name,
+            )
+        )
+    return collected_entries
+
+
+def resolve_target_from_collected_entries(
+    *,
+    decl_name: str,
+    decl_is_short_name: bool,
+    module_name: str,
+    collected_entries: list[dict[str, object]],
+) -> dict[str, object]:
+    target_entries = [entry for entry in collected_entries if str(entry["module"]) == module_name]
+    if decl_is_short_name:
+        matches = [entry for entry in target_entries if short_decl_name(str(entry["decl_name"])) == decl_name]
+    else:
+        matches = [entry for entry in target_entries if str(entry["decl_name"]) == decl_name]
+    if not matches:
+        fail(
+            "collect 结果中找不到目标声明。",
+            details=[f"目标声明：`{decl_name}`", f"目标模块：`{module_name}`"],
+            hints=[
+                "如果这里传的是短名，请确认该短名在目标模块里唯一。",
+                "如果需要精确指定，可改用 `--target <module>:<fully-qualified-decl>`。",
+            ],
+        )
+    if len(matches) > 1:
+        preview = "\n".join(f"- {entry['decl_name']}" for entry in matches[:10])
+        details = [
+            f"目标声明：`{decl_name}`",
+            f"目标模块：`{module_name}`",
+            "collect 结果中匹配到多个声明：\n" + preview,
+        ]
+        if len(matches) > 10:
+            details.append(f"其余候选：{len(matches) - 10} 个")
+        fail(
+            "目标声明在 collect 结果中不唯一。",
+            details=details,
+            hints=["请改用 `--target <module>:<fully-qualified-decl>`。"],
+        )
+    return dict(matches[0])
 
 
 def probe_decl_entries(
@@ -899,18 +1469,22 @@ def probe_decl_entries(
         return []
     grouped = group_entries_by_module(candidates)
 
-    def run_probe_job(module_name: str, module_entries: list[dict[str, object]]) -> tuple[str, list[dict[str, object]], Any, list[dict[str, object]]]:
-        result, payloads = run_lean_probe(
-            paths,
-            imports=[module_name],
-            command_lines=[
-                f"#print_temporary_axiom_decl_probe `{entry['decl_name']}"
-                for entry in module_entries
-            ],
-            description=f"{description_prefix} `{module_name}`",
-            allow_failure=True,
-        )
-        return module_name, module_entries, result, payloads
+    def run_probe_job(module_name: str, module_entries: list[dict[str, object]]) -> tuple[str, list[dict[str, object]]]:
+        if module_entries_require_local_replay(module_entries):
+            normalized = collect_decl_entries_via_replay(
+                paths,
+                module_name=module_name,
+                module_entries=module_entries,
+                description_prefix=description_prefix,
+            )
+        else:
+            normalized = collect_decl_entries_via_import_probe(
+                paths,
+                module_name=module_name,
+                module_entries=module_entries,
+                description_prefix=description_prefix,
+            )
+        return module_name, normalized
 
     job_specs = list(grouped.items())
     max_workers = min(len(job_specs), max(1, min(os.cpu_count() or 1, MAX_PROBE_WORKERS)))
@@ -920,35 +1494,10 @@ def probe_decl_entries(
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
             futures = [executor.submit(run_probe_job, module_name, module_entries) for module_name, module_entries in job_specs]
             job_results = [future.result() for future in futures]
-    result_by_module = {module_name: (module_entries, result, payloads) for module_name, module_entries, result, payloads in job_results}
+    normalized_by_module = {module_name: normalized for module_name, normalized in job_results}
     normalized: list[dict[str, object]] = []
     for module_name, _ in job_specs:
-        module_entries, result, payloads = result_by_module[module_name]
-        payload_by_name = {str(payload["decl_name"]): payload for payload in payloads}
-        missing = [str(entry["decl_name"]) for entry in module_entries if str(entry["decl_name"]) not in payload_by_name]
-        if missing:
-            preview = missing[:10]
-            details = [
-                f"模块：`{module_name}`",
-                f"缺失数量：{len(missing)}",
-                "缺失声明：\n" + "\n".join(f"- {decl_name}" for decl_name in preview),
-            ]
-            output = "\n".join(part for part in [result.stdout.strip(), result.stderr.strip()] if part)
-            if output:
-                details.append("probe 输出：\n" + output)
-            if len(missing) > len(preview):
-                details.append(f"其余缺失条目：{len(missing) - len(preview)} 个")
-            fail("Lean probe 没有返回全部候选声明。", details=details)
-        for entry in module_entries:
-            payload = payload_by_name[str(entry["decl_name"])]
-            normalized.append(
-                normalize_probed_decl(
-                    payload,
-                    module_name=str(entry["module"]),
-                    relative_file=str(entry["file"]),
-                    range_info=entry["range"],
-                )
-            )
+        normalized.extend(normalized_by_module[module_name])
     return normalized
 
 
@@ -1046,14 +1595,7 @@ def load_registry_db(paths) -> dict[str, Any]:
     if not isinstance(payload, dict):
         fail("proved theorem registry 数据格式无效。", details=[f"文件：`{paths.registry_db_file}`"])
     if payload.get("schema_version") != REGISTRY_SCHEMA_VERSION:
-        fail(
-            "proved theorem registry 的 schema 版本不受支持。",
-            details=[
-                f"文件：`{paths.registry_db_file}`",
-                f"期望版本：`{REGISTRY_SCHEMA_VERSION}`",
-                f"实际版本：`{payload.get('schema_version')}`",
-            ],
-        )
+        return empty_registry_db()
     payload.setdefault("tracked_modules", [])
     payload.setdefault("dirty_modules", [])
     payload.setdefault("module_digests", {})
@@ -1095,102 +1637,98 @@ def registry_permitted_axioms(registry_db: dict[str, Any]) -> list[dict[str, obj
     return sorted(entries, key=lambda item: (str(item["module"]), str(item["decl_name"])))
 
 
-def full_maintain_registry_for_modules(
+def refresh_registry_for_modules_from_collect(
     registry_db: dict[str, Any],
     *,
     modules: list[str],
     digests_by_module: dict[str, str],
-    proved_entries: list[dict[str, object]],
+    collected_entries: list[dict[str, object]],
     tracked_modules: list[str],
+    clear_dirty_modules: bool,
 ) -> dict[str, Any]:
-    modules_set = set(modules)
-    remaining_entries = [
+    modules_set = {str(module_name) for module_name in modules}
+    tracked_modules_set = {str(module_name) for module_name in tracked_modules}
+    collected_by_module = group_entries_by_module(
+        [
+            entry
+            for entry in collected_entries
+            if str(entry["module"]) in modules_set and not bool(entry.get("explicit_sorry", False))
+        ]
+    )
+    refreshed_entries = [
         entry
         for entry in registry_db.get("proved_theorems", [])
-        if str(entry.get("module")) not in modules_set
+        if str(entry.get("module")) not in modules_set and str(entry.get("module")) in tracked_modules_set
     ]
-    for entry in proved_entries:
-        remaining_entries.append(
-            {
-                "decl_name": str(entry["decl_name"]),
-                "module": str(entry["module"]),
-                "file": str(entry["file"]),
-                "statement_hash": str(entry["statement_hash"]),
-            }
-        )
+    for module_name in sorted(modules_set):
+        for entry in collected_by_module.get(module_name, []):
+            refreshed_entries.append(
+                {
+                    "decl_name": str(entry["decl_name"]),
+                    "module": str(entry["module"]),
+                    "file": str(entry["file"]),
+                    "statement_hash": str(entry["statement_hash"]),
+                }
+            )
     module_digests = dict(registry_db.get("module_digests", {}))
     for module_name in modules:
         digest = digests_by_module.get(module_name)
         if digest is not None:
             module_digests[module_name] = digest
+    existing_dirty = {str(module_name) for module_name in registry_db.get("dirty_modules", [])}
+    if clear_dirty_modules:
+        dirty_modules = existing_dirty - modules_set
+    else:
+        dirty_modules = existing_dirty | modules_set
     return {
         "schema_version": REGISTRY_SCHEMA_VERSION,
         "tracked_modules": sorted(tracked_modules),
-        "dirty_modules": sorted(set(str(module_name) for module_name in registry_db.get("dirty_modules", [])) - modules_set),
+        "dirty_modules": sorted(dirty_modules),
         "module_digests": module_digests,
         "proved_theorems": sorted(
-            remaining_entries,
+            refreshed_entries,
             key=lambda item: (str(item["module"]), str(item["decl_name"])),
         ),
     }
 
 
-def incremental_add_registry_entries(
-    registry_db: dict[str, Any],
+def collect_session_temporary_axioms_from_tracked(
     *,
-    new_entries: list[dict[str, object]],
-    dirty_modules: list[str],
-    tracked_modules: list[str],
-) -> dict[str, Any]:
-    existing = list(registry_db.get("proved_theorems", []))
-    existing_names = {str(entry.get("decl_name")) for entry in existing if isinstance(entry, dict)}
-    for entry in new_entries:
-        decl_name = str(entry["decl_name"])
-        if decl_name in existing_names:
+    target_info: dict[str, object],
+    tracked_modules: set[str],
+    collected_entries: list[dict[str, object]],
+) -> list[dict[str, object]]:
+    target_module = str(target_info["module"])
+    target_decl_name = str(target_info["decl_name"])
+    target_ordinal = (
+        int(target_info["ordinal"])
+        if "ordinal" in target_info and target_info["ordinal"] is not None
+        else None
+    )
+    temporary_entries: list[dict[str, object]] = []
+    for entry in collected_entries:
+        module_name = str(entry["module"])
+        if module_name not in tracked_modules:
             continue
-        existing_names.add(decl_name)
-        existing.append(
+        if not bool(entry.get("explicit_sorry", False)):
+            continue
+        if module_name == target_module:
+            if str(entry["decl_name"]) == target_decl_name:
+                continue
+            if target_ordinal is not None and int(entry["ordinal"]) >= target_ordinal:
+                continue
+        temporary_entries.append(
             {
-                "decl_name": decl_name,
-                "module": str(entry["module"]),
+                "decl_name": str(entry["decl_name"]),
+                "module": module_name,
                 "file": str(entry["file"]),
                 "statement_hash": str(entry["statement_hash"]),
+                "origin": "session_temporary",
             }
         )
-    return {
-        "schema_version": REGISTRY_SCHEMA_VERSION,
-        "tracked_modules": sorted(tracked_modules),
-        "dirty_modules": sorted(
-            set(str(module_name) for module_name in registry_db.get("dirty_modules", []))
-            | set(dirty_modules)
-        ),
-        "module_digests": dict(registry_db.get("module_digests", {})),
-        "proved_theorems": sorted(existing, key=lambda item: (str(item["module"]), str(item["decl_name"]))),
-    }
-
-
-def collect_proved_theorems_for_modules(paths, modules: list[str]) -> list[dict[str, object]]:
-    candidates: list[dict[str, object]] = []
-    for module_name in modules:
-        candidates.extend(
-            scan_theorem_like_entries(
-                paths,
-                module_name,
-                before_entry=None,
-                include_proved=True,
-                include_sorry=False,
-            )
-        )
-    proved_entries = probe_decl_entries(
-        paths,
-        candidates=candidates,
-        description_prefix="探测已证明定理的 theorem-side statement hash in",
-    )
-    for entry in proved_entries:
-        entry["origin"] = "persistent_proved"
     return sorted(
-        proved_entries,
-        key=lambda item: (str(item["module"]), int(item["range"]["line"]), int(item["range"]["column"]), str(item["decl_name"])),
+        temporary_entries,
+        key=lambda item: (str(item["module"]), str(item["decl_name"])),
     )
 
 
@@ -1203,24 +1741,45 @@ def collect_session_temporary_axioms(
 ) -> tuple[list[str], list[dict[str, object]]]:
     target_module = str(target_info["module"])
     closure = list(module_closure) if module_closure is not None else compute_module_closure(paths, target_module)
-    candidates: list[dict[str, object]] = []
+    temporary_entries: list[dict[str, object]] = []
     for module_name in closure:
-        if module_name not in tracked_modules:
+        if module_name in tracked_modules:
             continue
-        candidates.extend(
-            scan_theorem_like_entries(
-                paths,
-                module_name,
-                before_entry=target_info if module_name == target_module else None,
-                include_proved=False,
-                include_sorry=True,
-            )
+        temporary_candidates = scan_theorem_like_entries(
+            paths,
+            module_name,
+            before_entry=target_info if module_name == target_module else None,
+            include_proved=False,
+            include_sorry=True,
         )
-    temporary_entries = probe_decl_entries(
-        paths,
-        candidates=candidates,
-        description_prefix="探测 session temporary theorem 的 theorem-side statement hash in",
-    )
+        if not temporary_candidates:
+            continue
+        context_entries = scan_all_theorem_like_entries(
+            paths,
+            module_name,
+            before_entry=target_info if module_name == target_module else None,
+        )
+        if module_entries_require_local_replay(context_entries):
+            temporary_entries.extend(
+                select_hashed_entries(
+                    collect_decl_entries_via_replay(
+                        paths,
+                        module_name=module_name,
+                        module_entries=context_entries,
+                        description_prefix="重放模块并探测 session temporary theorem 的 theorem-side statement hash in",
+                    ),
+                    temporary_candidates,
+                )
+            )
+        else:
+            temporary_entries.extend(
+                collect_decl_entries_via_import_probe(
+                    paths,
+                    module_name=module_name,
+                    module_entries=temporary_candidates,
+                    description_prefix="探测 session temporary theorem 的 theorem-side statement hash in",
+                )
+            )
     for entry in temporary_entries:
         entry["origin"] = "session_temporary"
     return closure, sorted(
@@ -1246,6 +1805,17 @@ def merge_permitted_axioms(
         if decl_name == target_decl_name:
             continue
         merged[decl_name] = dict(entry)
+    return sorted(
+        merged.values(),
+        key=lambda item: (str(item["module"]), str(item["decl_name"])),
+    )
+
+
+def merge_session_temporary_axioms(*temporary_groups: list[dict[str, object]]) -> list[dict[str, object]]:
+    merged: dict[str, dict[str, object]] = {}
+    for group in temporary_groups:
+        for entry in group:
+            merged[str(entry["decl_name"])] = dict(entry)
     return sorted(
         merged.values(),
         key=lambda item: (str(item["module"]), str(item["decl_name"])),
@@ -1475,7 +2045,6 @@ def print_prepare_summary(
     module_closure: list[str],
     grouped_permitted_axioms: dict[str, list[dict[str, str]]],
     session_temporary_count: int,
-    verification_status: str,
 ) -> None:
     permitted_count = sum(len(entries) for entries in grouped_permitted_axioms.values())
     print(f"Prepared session for `{target_info['decl_name']}`.")
@@ -1499,10 +2068,7 @@ def print_prepare_summary(
                     print(f"    - {entry['decl_name']} [{entry['origin']}]")
     else:
         print("- permitted axiom list is long; see the saved report for the full grouped list.")
-    if verification_status == "completed":
-        print("- verification: completed via target-module rebuild")
-    else:
-        print("- verification: skipped by `--no-verify`")
+    print("- verification: completed via a final target-module build")
     print(f"- session data: {relative_path_str(paths.project_root, paths.session_file)}")
     print(f"- report: {relative_path_str(paths.project_root, paths.report_file)}")
     print(f"- proved registry DB: {relative_path_str(paths.project_root, paths.registry_db_file)}")
@@ -1525,30 +2091,6 @@ def assert_no_active_session(paths) -> None:
     )
 
 
-def verify_target_module_build(
-    paths,
-    *,
-    target_module: str,
-) -> None:
-    result = run_command(
-        paths,
-        ["lake", "build", target_module],
-        f"验证 prepared workspace 中 `{target_module}` 可以构建",
-        allow_failure=True,
-    )
-    if result.returncode == 0:
-        return
-    output = "\n".join(part for part in [result.stdout.strip(), result.stderr.strip()] if part)
-    fail(
-        "prepare 完成后，target 模块无法构建。",
-        details=[
-            f"目标模块：`{target_module}`",
-            "输出：\n" + (output or "<空>"),
-        ],
-        hints=["先检查当前报错是否来自目标模块自身，或某个受影响依赖模块。"],
-    )
-
-
 def prepare_session(args: argparse.Namespace, paths) -> None:
     acquire_prepare_lock(paths)
     updated_registry_db: dict[str, Any] | None = None
@@ -1566,58 +2108,7 @@ def prepare_session(args: argparse.Namespace, paths) -> None:
                     "只有直接导入 TemporaryAxiomTool 的项目模块，才会在 session 中启用 theorem registry。",
                 ],
             )
-        candidate_modules: list[str] | None = None
-        if requested_target.module_name is None:
-            candidate_modules = candidate_target_modules_from_decl_name(paths, requested_target.decl_name)
-            if not candidate_modules:
-                fail(
-                    "无法从完整声明名推断候选模块。",
-                    details=[f"目标声明：`{requested_target.decl_name}`"],
-                    hints=["如果该声明名与模块路径不对齐，请改用 `--target <module>:<decl>`。"],
-                )
-            missing_candidates = [module_name for module_name in candidate_modules if module_name not in current_tracked_modules]
-            if missing_candidates and set(candidate_modules).issubset(set(missing_candidates)):
-                fail(
-                    "目标候选模块尚未纳入 theorem registry 跟踪。",
-                    details=["候选模块：\n" + "\n".join(f"- {module_name}" for module_name in candidate_modules)],
-                    hints=["请在目标所在模块源码里直接 `import TemporaryAxiomTool` 后再重试。"],
-                )
-        if requested_target.module_name is not None:
-            print("Checking build artifacts for the target module closure...", flush=True)
-            prepared_closures_by_root = {
-                requested_target.module_name: ensure_module_artifacts_ready(
-                    paths,
-                    requested_target=args.target,
-                    root_module=requested_target.module_name,
-                    auto_build=args.auto_build,
-                )
-            }
-            ready_candidate_modules = None
-        else:
-            assert candidate_modules is not None
-            print("Checking build artifacts for candidate target modules...", flush=True)
-            prepared_closures_by_root = ensure_roots_artifacts_ready(
-                paths,
-                requested_target=args.target,
-                root_modules=candidate_modules,
-                auto_build=args.auto_build,
-            )
-            ready_candidate_modules = candidate_modules
-        ensure_probe_tool_ready(paths)
-        target_info = resolve_target_decl(
-            paths,
-            decl_name=requested_target.decl_name,
-            module_name=requested_target.module_name,
-            decl_is_short_name=requested_target.decl_is_short_name,
-            candidate_modules=ready_candidate_modules,
-        )
-        target_module = str(target_info["module"])
-        if target_module not in current_tracked_modules:
-            fail(
-                "目标模块尚未纳入 theorem registry 跟踪。",
-                details=[f"目标模块：`{target_module}`"],
-                hints=[f"在 `{target_module}` 的源码 import 头里加入 `import {TOOL_ROOT_MODULE}`。"],
-            )
+        inserted_shard_import_modules = ensure_stable_shard_imports(paths, current_tracked_modules)
         registry_db = load_registry_db(paths)
         current_source_hashes = collect_registry_source_hashes(paths, current_tracked_modules)
         dirty_modules = {str(module_name) for module_name in registry_db.get("dirty_modules", [])}
@@ -1629,32 +2120,179 @@ def prepare_session(args: argparse.Namespace, paths) -> None:
                 or module_name in dirty_modules
             )
         ]
-        if changed_tracked_modules:
-            print("Checking build artifacts for changed tracked modules...", flush=True)
+        if inserted_shard_import_modules:
+            changed_tracked_modules = merge_module_lists(changed_tracked_modules, inserted_shard_import_modules)
+
+        target_info_from_probe: dict[str, object] | None = None
+        if requested_target.module_name is None:
+            candidate_modules = candidate_target_modules_from_decl_name(paths, requested_target.decl_name)
+            if not candidate_modules:
+                fail(
+                    "无法从完整声明名推断候选模块。",
+                    details=[f"目标声明：`{requested_target.decl_name}`"],
+                    hints=["如果该声明名与模块路径不对齐，请改用 `--target <module>:<decl>`。"],
+                )
+            tracked_candidate_modules = [
+                module_name for module_name in candidate_modules if module_name in current_tracked_modules
+            ]
+            if not tracked_candidate_modules:
+                fail(
+                    "目标候选模块尚未纳入 theorem registry 跟踪。",
+                    details=["候选模块：\n" + "\n".join(f"- {module_name}" for module_name in candidate_modules)],
+                    hints=["请在目标所在模块源码里直接 `import TemporaryAxiomTool` 后再重试。"],
+                )
+            print("Checking build artifacts for candidate target modules...", flush=True)
             ensure_roots_artifacts_ready(
                 paths,
                 requested_target=args.target,
-                root_modules=changed_tracked_modules,
+                root_modules=tracked_candidate_modules,
                 auto_build=args.auto_build,
             )
-            print("Refreshing proved theorem registry for changed tracked modules...", flush=True)
-            proved_entries = collect_proved_theorems_for_modules(paths, changed_tracked_modules)
+            ensure_probe_tool_ready(paths)
+            target_info_from_probe = resolve_target_decl(
+                paths,
+                decl_name=requested_target.decl_name,
+                module_name=None,
+                decl_is_short_name=False,
+                candidate_modules=tracked_candidate_modules,
+            )
+            target_module = str(target_info_from_probe["module"])
         else:
-            proved_entries = []
-        updated_registry_db = full_maintain_registry_for_modules(
+            target_module = requested_target.module_name
+
+        if target_module not in current_tracked_modules:
+            fail(
+                "目标模块尚未纳入 theorem registry 跟踪。",
+                details=[f"目标模块：`{target_module}`"],
+                hints=[f"在 `{target_module}` 的源码 import 头里加入 `import {TOOL_ROOT_MODULE}`。"],
+            )
+
+        target_closure = compute_module_closure(paths, target_module)
+        relevant_tracked_modules = [
+            module_name
+            for module_name in target_closure
+            if module_name in current_tracked_modules
+        ]
+        changed_relevant_tracked_modules = [
+            module_name for module_name in relevant_tracked_modules if module_name in changed_tracked_modules
+        ]
+        unchanged_relevant_tracked_modules = [
+            module_name for module_name in relevant_tracked_modules if module_name not in changed_tracked_modules
+        ]
+        use_fast_prepare_path = not changed_relevant_tracked_modules
+        collect_modules = dependency_first_module_order(
+            paths,
+            (
+                changed_tracked_modules
+                if use_fast_prepare_path
+                else merge_module_lists(changed_tracked_modules, relevant_tracked_modules)
+            ),
+        )
+        if collect_modules:
+            print("Collecting theorem-side hashes for changed tracked modules...", flush=True)
+            write_collect_shards(
+                paths,
+                tracked_modules=current_tracked_modules,
+                collect_modules=collect_modules,
+            )
+            collected_entries = collect_tracked_theorems_by_build(
+                paths,
+                collect_modules=collect_modules,
+            )
+        else:
+            collected_entries = []
+        if use_fast_prepare_path:
+            replay_modules = [target_module]
+            replay_modules.extend(
+                module_name
+                for module_name in unchanged_relevant_tracked_modules
+                if module_name != target_module
+                and scan_theorem_like_entries(
+                    paths,
+                    module_name,
+                    before_entry=None,
+                    include_proved=False,
+                    include_sorry=True,
+                )
+            )
+            print("Locally replaying target / explicit-sorry tracked modules for theorem-side hashes...", flush=True)
+            replayed_entries = collect_tracked_theorems_by_local_replay(
+                paths,
+                replay_modules=replay_modules,
+            )
+        else:
+            replay_modules = []
+            replayed_entries = []
+
+        if use_fast_prepare_path:
+            target_info = resolve_target_from_collected_entries(
+                decl_name=(
+                    str(target_info_from_probe["decl_name"])
+                    if requested_target.module_name is None and target_info_from_probe is not None
+                    else requested_target.decl_name
+                ),
+                decl_is_short_name=(
+                    False if requested_target.module_name is None else requested_target.decl_is_short_name
+                ),
+                module_name=target_module,
+                collected_entries=replayed_entries,
+            )
+        else:
+            target_info = resolve_target_from_collected_entries(
+                decl_name=(
+                    str(target_info_from_probe["decl_name"])
+                    if requested_target.module_name is None and target_info_from_probe is not None
+                    else requested_target.decl_name
+                ),
+                decl_is_short_name=(
+                    False if requested_target.module_name is None else requested_target.decl_is_short_name
+                ),
+                module_name=target_module,
+                collected_entries=collected_entries,
+            )
+
+        if changed_tracked_modules:
+            print("Refreshing proved theorem registry for changed tracked modules...", flush=True)
+        updated_registry_db = refresh_registry_for_modules_from_collect(
             registry_db,
             modules=changed_tracked_modules,
             digests_by_module=current_source_hashes,
-            proved_entries=proved_entries,
+            collected_entries=collected_entries,
             tracked_modules=current_tracked_modules,
+            clear_dirty_modules=True,
         )
-        target_closure = prepared_closures_by_root.get(target_module)
+        write_registry_db(paths, updated_registry_db)
+
+        if use_fast_prepare_path:
+            tracked_session_temporary_axioms = merge_session_temporary_axioms(
+                collect_session_temporary_axioms_from_tracked(
+                    target_info=target_info,
+                    tracked_modules=set(changed_relevant_tracked_modules),
+                    collected_entries=collected_entries,
+                ),
+                collect_session_temporary_axioms_from_tracked(
+                    target_info=target_info,
+                    tracked_modules=set(replay_modules),
+                    collected_entries=replayed_entries,
+                ),
+            )
+        else:
+            tracked_session_temporary_axioms = collect_session_temporary_axioms_from_tracked(
+                target_info=target_info,
+                tracked_modules=set(relevant_tracked_modules),
+                collected_entries=collected_entries,
+            )
+        ensure_probe_tool_ready(paths)
         print("Scanning target closure for session-local explicit `sorry` theorems...", flush=True)
-        module_closure, session_temporary_axioms = collect_session_temporary_axioms(
+        module_closure, untracked_session_temporary_axioms = collect_session_temporary_axioms(
             paths,
             target_info=target_info,
             tracked_modules=set(current_tracked_modules),
             module_closure=target_closure,
+        )
+        session_temporary_axioms = merge_session_temporary_axioms(
+            tracked_session_temporary_axioms,
+            untracked_session_temporary_axioms,
         )
         persistent_axioms = registry_permitted_axioms(updated_registry_db)
         permitted_axioms = merge_permitted_axioms(
@@ -1662,23 +2300,32 @@ def prepare_session(args: argparse.Namespace, paths) -> None:
             persistent_axioms=persistent_axioms,
             session_temporary_axioms=session_temporary_axioms,
         )
-        inserted_shard_import_modules = ensure_stable_shard_imports(paths, current_tracked_modules)
-        if inserted_shard_import_modules:
-            refreshed_hashes = collect_registry_source_hashes(paths, inserted_shard_import_modules)
-            updated_registry_db["module_digests"].update(refreshed_hashes)
-        write_registry_db(paths, updated_registry_db)
-        write_generated_shards(
+        write_active_shards(
             paths,
             tracked_modules=current_tracked_modules,
             target_decl=str(target_info["decl_name"]),
             target_hash=str(target_info["statement_hash"]),
             permitted_axioms=permitted_axioms,
         )
-        verification_status = "skipped_disabled"
-        if args.verify:
-            print("Verifying prepared workspace by rebuilding the target module...", flush=True)
-            verify_target_module_build(paths, target_module=target_module)
-            verification_status = "completed"
+        print("Verifying prepared workspace by building the target module...", flush=True)
+        target_build_result = run_command(
+            paths,
+            ["lake", "build", target_module],
+            f"验证 prepared workspace 中 `{target_module}` 可以构建",
+            allow_failure=True,
+        )
+        if target_build_result.returncode != 0:
+            output = "\n".join(
+                part for part in [target_build_result.stdout.strip(), target_build_result.stderr.strip()] if part
+            )
+            fail(
+                "prepare 完成后，target 模块仍然无法构建。",
+                details=[
+                    f"目标模块：`{target_module}`",
+                    "输出：\n" + (output or "<空>"),
+                ],
+                hints=["先检查当前报错是否来自 target 模块自身，或是否存在与 theorem-registry 无关的编译错误。"],
+            )
         base_commit = args.base_commit if args.base_commit is not None else try_git_head(paths)
         session_payload = {
             "schema_version": SESSION_SCHEMA_VERSION,
@@ -1724,14 +2371,12 @@ def prepare_session(args: argparse.Namespace, paths) -> None:
             module_closure=module_closure,
             grouped_permitted_axioms=grouped_permitted_axioms,
             session_temporary_count=len(session_temporary_axioms),
-            verification_status=verification_status,
         )
     except BaseException:
-        if updated_registry_db is not None and current_tracked_modules:
+        if current_tracked_modules:
             write_inactive_shards(
                 paths,
                 tracked_modules=current_tracked_modules,
-                persistent_axioms=registry_permitted_axioms(updated_registry_db),
             )
         remove_session_artifacts(paths)
         raise
@@ -1742,46 +2387,56 @@ def prepare_session(args: argparse.Namespace, paths) -> None:
 def cleanup_session(paths) -> None:
     session_payload = load_session(paths)
     current_tracked_modules = discover_tracked_modules(paths)
+    inserted_shard_import_modules = ensure_stable_shard_imports(paths, current_tracked_modules)
     registry_db = load_registry_db(paths)
     current_hashes = collect_registry_source_hashes(paths, current_tracked_modules)
+    dirty_modules = {str(module_name) for module_name in registry_db.get("dirty_modules", [])}
     changed_tracked_modules = [
         module_name
         for module_name in current_tracked_modules
-        if registry_db.get("module_digests", {}).get(module_name) != current_hashes[module_name]
-    ]
+        if (
+                registry_db.get("module_digests", {}).get(module_name) != current_hashes[module_name]
+                or module_name in dirty_modules
+            )
+        ]
+    if inserted_shard_import_modules:
+        changed_tracked_modules = merge_module_lists(changed_tracked_modules, inserted_shard_import_modules)
     if changed_tracked_modules:
-        print("Checking build artifacts for changed tracked modules before cleanup...", flush=True)
-        ensure_roots_artifacts_ready(
+        print("Refreshing proved theorem registry for changed tracked modules...", flush=True)
+        write_collect_shards(
             paths,
-            requested_target=extract_session_target(session_payload)["decl_name"],
-            root_modules=changed_tracked_modules,
-            auto_build=True,
+            tracked_modules=current_tracked_modules,
+            collect_modules=changed_tracked_modules,
         )
-        print("Collecting newly proved theorems from changed tracked modules...", flush=True)
-        proved_entries = collect_proved_theorems_for_modules(paths, changed_tracked_modules)
+        collected_entries = collect_tracked_theorems_by_build(
+            paths,
+            collect_modules=changed_tracked_modules,
+        )
     else:
-        proved_entries = []
-    updated_registry_db = incremental_add_registry_entries(
+        collected_entries = []
+    updated_registry_db = refresh_registry_for_modules_from_collect(
         registry_db,
-        new_entries=proved_entries,
-        dirty_modules=changed_tracked_modules,
+        modules=changed_tracked_modules,
+        digests_by_module=current_hashes,
+        collected_entries=collected_entries,
         tracked_modules=current_tracked_modules,
+        clear_dirty_modules=True,
     )
     write_registry_db(paths, updated_registry_db)
     write_inactive_shards(
         paths,
         tracked_modules=current_tracked_modules,
-        persistent_axioms=registry_permitted_axioms(updated_registry_db),
     )
     remove_session_artifacts(paths)
+    previous_decl_names = {
+        str(existing.get("decl_name"))
+        for existing in registry_db.get("proved_theorems", [])
+        if isinstance(existing, dict)
+    }
     new_decl_names = {
         str(entry["decl_name"])
-        for entry in proved_entries
-        if str(entry["decl_name"]) not in {
-            str(existing.get("decl_name"))
-            for existing in registry_db.get("proved_theorems", [])
-            if isinstance(existing, dict)
-        }
+        for entry in updated_registry_db.get("proved_theorems", [])
+        if isinstance(entry, dict) and str(entry.get("decl_name")) not in previous_decl_names
     }
     print("Cleaned up the active theorem-registry session.")
     print(f"- tracked modules: {len(current_tracked_modules)}")
@@ -1810,13 +2465,6 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Automatically refresh stale or missing module artifacts before resolving the target or refreshing changed tracked modules.",
     )
-    prepare.add_argument(
-        "--no-verify",
-        dest="verify",
-        action="store_false",
-        help="Skip the final target-module rebuild after writing active shards.",
-    )
-    prepare.set_defaults(verify=True)
 
     subparsers.add_parser("cleanup", help="Deactivate the current session and update the persistent proved theorem registry.")
     return parser

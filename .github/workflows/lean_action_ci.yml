@@ -16,10 +16,16 @@ jobs:
         run: python3 -m py_compile scripts/temporary_axiom_session.py scripts/session_tool/*.py
       - name: Session Roundtrip
         run: |
-          lake build TemporaryAxiomTool TemporaryAxiomTool.TestFixture.Target
+          lake build TemporaryAxiomTool TemporaryAxiomTool.TestFixture.Target TemporaryAxiomTool.TestFixture.PrivateReplay
           python3 scripts/temporary_axiom_session.py prepare \
-            --target TemporaryAxiomTool.TestFixture.Target.goal \
+            --target TemporaryAxiomTool.TestFixture.Target:goal \
             --auto-build
           lake build TemporaryAxiomTool.TestFixture.Target
           python3 scripts/temporary_axiom_session.py cleanup
           lake build TemporaryAxiomTool.TestFixture.Target
+          python3 scripts/temporary_axiom_session.py prepare \
+            --target TemporaryAxiomTool.TestFixture.PrivateReplay:goal \
+            --auto-build
+          lake build TemporaryAxiomTool.TestFixture.PrivateReplay
+          python3 scripts/temporary_axiom_session.py cleanup
+          lake build TemporaryAxiomTool.TestFixture.PrivateReplay

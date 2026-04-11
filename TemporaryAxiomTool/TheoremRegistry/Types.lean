@@ -6,6 +6,12 @@ namespace TemporaryAxiomTool.TheoremRegistry
 
 open Lean
 
+public inductive ModuleShardMode where
+  | inactive
+  | collect
+  | active
+  deriving Inhabited, Repr, BEq
+
 public structure RegisteredTheorem where
   name : Name
   statementHash : UInt64
@@ -22,13 +28,17 @@ public def insertRegisteredTheoremBatch
 
 public structure ModuleShard where
   hostModule : Name
+  mode : ModuleShardMode := .inactive
   targetName : Name := Name.anonymous
   targetHash : UInt64 := 0
   permitted : RegisteredTheoremMap := {}
   deriving Inhabited
 
 public def ModuleShard.hasActiveSession (shard : ModuleShard) : Bool :=
-  shard.targetName != Name.anonymous
+  shard.mode == .active
+
+public def ModuleShard.inCollectMode (shard : ModuleShard) : Bool :=
+  shard.mode == .collect
 
 public def ModuleShard.permittedFor? (shard : ModuleShard) (declName : Name) : Option RegisteredTheorem :=
   shard.permitted.find? declName
