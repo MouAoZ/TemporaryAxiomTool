@@ -20,9 +20,11 @@
 - `main`
   `prepare` 会对 `changed tracked ∪ target closure 内的 tracked modules` 一起做 collect build。
 - `wild-skip`
-  若 `target closure` 里的 tracked modules 都没变，则只对真正变了的 tracked modules 做 collect build；对未变化但与当前 target 相关的 tracked modules，改为本地 collect replay 取 theorem-side hash。
+  tracked modules 的信息收集改为依赖序的 module-local collect replay，不再逐模块 `lake build`。
+- `wild-skip`
+  若 `target closure` 里的 tracked modules 都没变，则只 replay 真正变了的 tracked modules，再额外 replay 当前 target module 和相关的显式 `sorry` tracked modules。
 - 两者共同点
-  都保留 theorem-side hash 语义，也都只在必要时做最后一次真实 `lake build <target-module>` verify。`wild-skip` 改的是 steady-state prepare 的成本，不改安全边界。
+  都保留 theorem-side hash 语义。`wild-skip` 改的是 prepare 的收集实现，不改安全边界。
 
 ## 快速使用
 
@@ -46,7 +48,7 @@ python3 scripts/temporary_axiom_session.py prepare \
   --target YourProject.Section.goal
 ```
 
-若用 `<module>:<decl>` 形式，`prepare` 会直接通过 collect build 收集 tracked modules 的 theorem-side hash。只有在按完整声明名解析 target、或需要补齐某些普通模块产物时，才会用到 `--auto-build`：
+若用 `<module>:<decl>` 形式，`prepare` 会直接通过依赖序 local replay 收集 tracked modules 的 theorem-side hash。只有在按完整声明名解析 target、或需要补齐某些普通模块产物时，才会用到 `--auto-build`：
 
 ```bash
 python3 scripts/temporary_axiom_session.py prepare \
@@ -54,10 +56,7 @@ python3 scripts/temporary_axiom_session.py prepare \
   --auto-build
 ```
 
-`prepare` 现在只在必要时才会做最后一次真实 `lake build <target-module>`：
-
-- 若 target module 没有在本轮 collect build 中真实跑过，仍会做 eager active verify。
-- 若 target module 已在本轮 collect build 中真实跑过，则跳过这次 eager verify。
+`prepare` 在写完 active shards 后会做一次真实 `lake build <target-module>`，确认 prepared workspace 可直接编译。
 
 结束后清理当前 session：
 
@@ -112,11 +111,11 @@ freeze = session["freeze"]
 2. 先做一轮便宜的早期检查；若检测到无活动 session 下残留的 transient shard import，会立即报错，不再继续长流程。
 3. 必要时给 tracked modules 插入稳定 shard import。
 4. 找出发生变化的 tracked modules，并取 `changed tracked ∪ target closure 内的 tracked modules`。
-5. 把这些模块切到 collect 模式，逐模块真实 `lake build`，一次拿到 theorem-side hash、显式 `sorry` 标记和源码顺序信息。
+5. 按依赖顺序对这些 tracked modules 做 module-local collect replay，一次拿到 theorem-side hash、显式 `sorry` 标记和源码顺序信息。
 6. 用 collect 结果刷新持久 proved DB：只登记非 `sorry` 的 theorem / lemma。
 7. 从 collect 结果中提取 tracked 部分的 session-local temporary theorems；对 target closure 里未 tracked 的模块，先做源码扫描找候选，再临时插入 shard import，用本地 collect replay 取得正确的 theorem-side hash。
 8. 写入 active shards。
-9. 只有在必要时才做一次 eager active verify；否则直接跳过。
+9. 写完 active shards 后，做一次真实 `lake build <target-module>` verify。
 10. 写出 `session.json` 与明文报告。
 
 `prepare` 里的冻结信息统一使用 Lean elaboration 后的 theorem-side statement hash，而不是源码文本 hash。
